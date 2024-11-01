@@ -161,7 +161,7 @@ def test_run_train(tmp_path, fitting_configs):
         -0.14751978636626545,
     ]
 
-    assert np.allclose(Es, ref_Es)
+    assert np.allclose(Es, ref_Es) # allclose is used to compare floating point numbers
 
 
 def test_run_train_missing_data(tmp_path, fitting_configs):

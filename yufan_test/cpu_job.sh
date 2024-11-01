@@ -1,0 +1,10 @@
+#!/bin/bash -l
+#SBATCH --account=pawsey0799
+#SBATCH --partition=long
+#SBATCH --time=4-00:00:00
+#SBATCH --exclusive
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=256
+#SBATCH --threads-per-core=2
+#SBATCH --output=STDOUT
