@@ -454,6 +454,286 @@ class ScaleShiftMACE(MACE):
         return output
 
 
+
+import torch.nn as nn
+import torch.nn.functional as F
+class ResidualBlock(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super(ResidualBlock, self).__init__()
+        self.fc = nn.Linear(input_dim, output_dim)
+        self.bn = nn.BatchNorm1d(output_dim)
+        # self.activation = nn.Tanh()  # You can replace this with F.relu or other activation functions
+        # self.activation = F.relu  # LeakyReLU  
+        self.activation = nn.LeakyReLU(negative_slope=0.01)        
+        
+        # Add a linear layer to match dimensions if needed
+        if input_dim != output_dim:
+            self.match_dim = nn.Linear(input_dim, output_dim)
+        else:
+            self.match_dim = None
+
+    def forward(self, x):
+        residual = x
+        out = self.fc(x)
+        out = self.bn(out)
+        out = self.activation(out)
+        
+        if self.match_dim is not None:
+            residual = self.match_dim(residual)
+        
+        out = out + residual # Use out-of-place addition        
+        
+        return out
+    
+    
+class ResidualBlockBS1(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super(ResidualBlockBS1, self).__init__()    
+        self.fc = nn.Linear(input_dim, output_dim)
+        self.in_norm = nn.InstanceNorm1d(output_dim)
+        self.activation = nn.Tanh()  # You can replace this with F.relu or other activation functions
+        # self.activation = F.relu    
+        
+        # Add a linear layer to match dimensions if needed
+        if input_dim != output_dim:
+            self.match_dim = nn.Linear(input_dim, output_dim)
+        else:
+            self.match_dim = None
+
+    def forward(self, x):
+        residual = x
+        out = self.fc(x)
+        
+        # Apply instance normalization
+        out = self.in_norm(out.unsqueeze(0)).squeeze(0)
+        
+        out = self.activation(out)
+        
+        if self.match_dim is not None:
+            residual = self.match_dim(residual)
+        
+        out = out + residual  # Use out-of-place addition        
+        
+        return out
+
+
+@compile_mode("script")
+class ScaleShiftMACExTB(MACE):
+    def __init__(
+        self,
+        atomic_inter_scale: float,
+        atomic_inter_shift: float,
+        outdim: int,
+        outdim_globpar: int,
+        half_range_pt: Optional[torch.Tensor] = None,
+        half_range_pt_globpar: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.scale_shift = ScaleShiftBlock(
+            scale=atomic_inter_scale, shift=atomic_inter_shift
+        )
+        self.outdim = outdim
+        self.outdim_globpar = outdim_globpar
+        self.parallel_units = 64
+        self.parallel_units_globpar = 128
+        
+        if half_range_pt is None:
+            half_range_pt = torch.Tensor([0.25] * self.outdim)
+        self.half_range_pt = half_range_pt
+        
+        if half_range_pt_globpar is None:
+            half_range_pt_globpar = torch.Tensor([0.25] * self.outdim)
+        self.half_range_pt_globpar = half_range_pt_globpar
+
+        
+        # Define separate output heads for each dimension of the output
+        self.output_heads = nn.ModuleList()
+        for _ in range(self.outdim):
+            head = nn.Sequential(
+                ResidualBlock(64, self.parallel_units),
+                # ResidualBlock(1632, self.parallel_units), 
+                ResidualBlock(self.parallel_units, self.parallel_units),
+                ResidualBlock(self.parallel_units, self.parallel_units),
+                nn.Linear(self.parallel_units, 1)
+            )
+            self.output_heads.append(head)
+
+        # globpar
+        self.output_globpar_heads = nn.ModuleList()
+        for _ in range(self.outdim_globpar):
+            head = nn.Sequential(
+                ResidualBlockBS1(64, self.parallel_units_globpar),
+                # ResidualBlock(1632, self.parallel_units_globpar), 
+                ResidualBlockBS1(self.parallel_units_globpar, self.parallel_units_globpar),
+                ResidualBlockBS1(self.parallel_units_globpar, self.parallel_units_globpar),
+                nn.Linear(self.parallel_units_globpar, 1)
+            )
+            self.output_globpar_heads.append(head)
+
+
+    def forward(
+        self,
+        data: Dict[str, torch.Tensor],
+        training: bool = False,
+        compute_force: bool = True,
+        compute_virials: bool = False,
+        compute_stress: bool = False,
+        compute_displacement: bool = False,
+        compute_hessian: bool = False,
+    ) -> Dict[str, Optional[torch.Tensor]]:
+        # Setup
+        data["positions"].requires_grad_(True)
+        data["node_attrs"].requires_grad_(True)
+        num_graphs = data["ptr"].numel() - 1
+        num_atoms_arange = torch.arange(data["positions"].shape[0])
+        node_heads = (
+            data["head"][data["batch"]]
+            if "head" in data
+            else torch.zeros_like(data["batch"])
+        )
+        displacement = torch.zeros(
+            (num_graphs, 3, 3),
+            dtype=data["positions"].dtype,
+            device=data["positions"].device,
+        )
+        if compute_virials or compute_stress or compute_displacement:
+            (
+                data["positions"],
+                data["shifts"],
+                displacement,
+            ) = get_symmetric_displacement(
+                positions=data["positions"],
+                unit_shifts=data["unit_shifts"],
+                cell=data["cell"],
+                edge_index=data["edge_index"],
+                num_graphs=num_graphs,
+                batch=data["batch"],
+            )
+
+        # Atomic energies
+        node_e0 = self.atomic_energies_fn(data["node_attrs"])[
+            num_atoms_arange, node_heads
+        ]
+        e0 = scatter_sum(
+            src=node_e0, index=data["batch"], dim=0, dim_size=num_graphs
+        )  # [n_graphs, num_heads]
+
+        # Embeddings
+        node_feats = self.node_embedding(data["node_attrs"])
+        vectors, lengths = get_edge_vectors_and_lengths(
+            positions=data["positions"],
+            edge_index=data["edge_index"],
+            shifts=data["shifts"],
+        )
+        edge_attrs = self.spherical_harmonics(vectors)
+        edge_feats = self.radial_embedding(
+            lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers
+        )
+        if hasattr(self, "pair_repulsion"):
+            pair_node_energy = self.pair_repulsion_fn(
+                lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers
+            )
+        else:
+            pair_node_energy = torch.zeros_like(node_e0)
+        # Interactions
+        node_es_list = [pair_node_energy]
+        node_feats_list = []
+        for interaction, product, readout in zip(
+            self.interactions, self.products, self.readouts
+        ):
+            node_feats, sc = interaction(
+                node_attrs=data["node_attrs"],
+                node_feats=node_feats,
+                edge_attrs=edge_attrs,
+                edge_feats=edge_feats,
+                edge_index=data["edge_index"],
+            )
+            node_feats = product(   # work on this
+                node_feats=node_feats, sc=sc, node_attrs=data["node_attrs"]
+            )
+            node_feats_list.append(node_feats)
+            node_es_list.append(
+                readout(node_feats, node_heads)[num_atoms_arange, node_heads]
+            )  # {[n_nodes, ], }
+
+        # Yufan: node_es_list, shape (3, num_atoms*n_batch)
+        # Yufan: node_feats_list, shape (num_atoms*n_batch, len(features))
+        
+        # use ResidualBlock to get separate output heads for each feature
+        # from node_feats_list
+        
+        # ignore node_es_list for now
+        # node_feats_list
+        
+        # Concatenate node features
+        node_feats_out = torch.cat(node_feats_list, dim=-1)
+        # Pass through separate output heads
+        outputs = []
+        for head in self.output_heads:
+            outputs.append(head(node_feats_out))
+        # Concatenate outputs and apply half_range_pt
+        params_pred = torch.cat(outputs, dim=1) * self.half_range_pt
+
+        # Sum global features
+        global_feats = torch.sum(node_feats_out, dim=0).unsqueeze(0)  # [1, len(features)]
+        # Pass through separate output heads
+        outputs_globpar = []
+        for head in self.output_globpar_heads:
+            outputs_globpar.append(head(global_feats))
+        # Concatenate outputs and apply half_range_pt_globpar
+        outputs_globpar = torch.cat(outputs_globpar, dim=1) * self.half_range_pt_globpar        # check output shape
+        
+        
+         
+        # # Concatenate node features
+        # node_feats_out = torch.cat(node_feats_list, dim=-1)
+        # # Sum over interactions
+        # node_inter_es = torch.sum(  
+        #     torch.stack(node_es_list, dim=0), dim=0
+        # )  # [n_nodes, ]
+        # node_inter_es = self.scale_shift(node_inter_es, node_heads)
+
+        # # Sum over nodes in graph
+        # inter_e = scatter_sum(
+        #     src=node_inter_es, index=data["batch"], dim=-1, dim_size=num_graphs
+        # )  # [n_graphs,]
+
+        # # Add E_0 and (scaled) interaction energy
+        # total_energy = e0 + inter_e
+        # node_energy = node_e0 + node_inter_es
+        
+        
+        
+        # forces, virials, stress, hessian = get_outputs(
+        #     energy=inter_e,
+        #     positions=data["positions"],
+        #     displacement=displacement,
+        #     cell=data["cell"],
+        #     training=training,
+        #     compute_force=compute_force,
+        #     compute_virials=compute_virials,
+        #     compute_stress=compute_stress,
+        #     compute_hessian=compute_hessian,
+        # )
+        output = {
+            # "energy": total_energy,
+            # "node_energy": node_energy,
+            # "interaction_energy": inter_e,
+            # "forces": forces,
+            # "virials": virials,
+            # "stress": stress,
+            # "hessian": hessian,
+            # "displacement": displacement,
+            "params_pred": params_pred,
+            "globpars_pred": outputs_globpar,
+            "node_feats": node_feats_out,
+        }
+
+        return output
+
+
+
 class BOTNet(torch.nn.Module):
     def __init__(
         self,

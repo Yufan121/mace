@@ -105,10 +105,18 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
             "BOTNet",
             "MACE",
             "ScaleShiftMACE",
+            "ScaleShiftMACExTB",
             "ScaleShiftBOTNet",
             "AtomicDipolesMACE",
             "EnergyDipolesMACE",
         ],
+    )
+    ### Add other args, Yufan, outdim
+    parser.add_argument(
+        "--outdim", help="Yufan: lens of parameters for NNxTB output", type=int, default=21
+    )
+    parser.add_argument(
+        "--outdim_globpar", help="Yufan: lens of global parameters for NNxTB output", type=int, default=24
     )
     parser.add_argument(
         "--r_max", help="distance cutoff (in Ang)", type=float, default=5.0
