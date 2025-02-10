@@ -475,7 +475,8 @@ class ResidualBlock(nn.Module):
     def forward(self, x):
         residual = x
         out = self.fc(x)
-        out = self.bn(out)
+        if x.size(0) > 1:
+            out = self.bn(out)
         out = self.activation(out)
         
         if self.match_dim is not None:
@@ -491,9 +492,10 @@ class ResidualBlockBS1(nn.Module):
         super(ResidualBlockBS1, self).__init__()    
         self.fc = nn.Linear(input_dim, output_dim)
         self.in_norm = nn.InstanceNorm1d(output_dim)
-        self.activation = nn.Tanh()  # You can replace this with F.relu or other activation functions
-        # self.activation = F.relu    
-        
+        # self.activation = nn.Tanh()  # You can replace this with F.relu or other activation functions
+        # self.activation = F.relu   
+        self.activation = nn.LeakyReLU(negative_slope=0.01)        
+ 
         # Add a linear layer to match dimensions if needed
         if input_dim != output_dim:
             self.match_dim = nn.Linear(input_dim, output_dim)
@@ -515,6 +517,20 @@ class ResidualBlockBS1(nn.Module):
         out = out + residual  # Use out-of-place addition        
         
         return out
+
+class PlusMinusSqrtIdentity(nn.Module):
+    def forward(self, x):
+        # Apply identity function for the range -1 to 1
+        identity_mask = (x >= -1) & (x <= 1)
+        identity_output = x * identity_mask.float()
+        
+        # Apply ±sqrt function for other areas
+        sqrt_mask = ~identity_mask
+        sqrt_output = torch.sign(x) * torch.sqrt(torch.abs(x)) * sqrt_mask.float()
+        
+        # Combine the outputs
+        output = identity_output + sqrt_output
+        return output
 
 
 @compile_mode("script")
@@ -539,11 +555,11 @@ class ScaleShiftMACExTB(MACE):
         self.parallel_units_globpar = 128
         
         if half_range_pt is None:
-            half_range_pt = torch.Tensor([0.25] * self.outdim)
+            half_range_pt = torch.Tensor([0.05] * self.outdim)
         self.half_range_pt = half_range_pt
         
         if half_range_pt_globpar is None:
-            half_range_pt_globpar = torch.Tensor([0.25] * self.outdim)
+            half_range_pt_globpar = torch.Tensor([0.05] * self.outdim_globpar)
         self.half_range_pt_globpar = half_range_pt_globpar
 
         
@@ -571,6 +587,7 @@ class ScaleShiftMACExTB(MACE):
             )
             self.output_globpar_heads.append(head)
 
+        self.out = PlusMinusSqrtIdentity()
 
     def forward(
         self,
@@ -581,6 +598,7 @@ class ScaleShiftMACExTB(MACE):
         compute_stress: bool = False,
         compute_displacement: bool = False,
         compute_hessian: bool = False,
+        output_indices = None, # if provided, only output output_indices's node features
     ) -> Dict[str, Optional[torch.Tensor]]:
         # Setup
         data["positions"].requires_grad_(True)
@@ -666,14 +684,25 @@ class ScaleShiftMACExTB(MACE):
         # ignore node_es_list for now
         # node_feats_list
         
+        # node_attr is the element types 
+        
         # Concatenate node features
         node_feats_out = torch.cat(node_feats_list, dim=-1)
         # Pass through separate output heads
         outputs = []
         for head in self.output_heads:
             outputs.append(head(node_feats_out))
-        # Concatenate outputs and apply half_range_pt
-        params_pred = torch.cat(outputs, dim=1) * self.half_range_pt
+        if len(outputs) > 0:
+            # Concatenate outputs and apply half_range_pt
+            params_pred = torch.cat(outputs, dim=1) 
+            # shrink the output
+            params_pred = self.out(params_pred) * self.half_range_pt
+        else:
+            params_pred = None
+
+        if output_indices is not None:
+            params_pred = params_pred[output_indices]
+
 
         # Sum global features
         global_feats = torch.sum(node_feats_out, dim=0).unsqueeze(0)  # [1, len(features)]
@@ -681,10 +710,15 @@ class ScaleShiftMACExTB(MACE):
         outputs_globpar = []
         for head in self.output_globpar_heads:
             outputs_globpar.append(head(global_feats))
-        # Concatenate outputs and apply half_range_pt_globpar
-        outputs_globpar = torch.cat(outputs_globpar, dim=1) * self.half_range_pt_globpar        # check output shape
         
-        
+        if len(outputs_globpar) > 0:
+            # Concatenate outputs and apply half_range_pt_globpar
+            outputs_globpar = torch.cat(outputs_globpar, dim=1)         # check output shape
+            # shrink the output
+            outputs_globpar = self.out(outputs_globpar) * self.half_range_pt_globpar
+        else:
+            outputs_globpar = None
+         
          
         # # Concatenate node features
         # node_feats_out = torch.cat(node_feats_list, dim=-1)
