@@ -16,12 +16,15 @@ class Collater:
 
     def __call__(self, batch):
         elem = batch[0]
+        print(f"elem: {elem}")
         if isinstance(elem, Data):
+            # print(f'self.follow_batch: {self.follow_batch}')
             return Batch.from_data_list(
                 batch,
                 follow_batch=self.follow_batch,
                 exclude_keys=self.exclude_keys,
             )
+            return batch
         elif isinstance(elem, torch.Tensor):
             return default_collate(batch)
         elif isinstance(elem, float):
@@ -34,9 +37,12 @@ class Collater:
             return {key: self([data[key] for data in batch]) for key in elem}
         elif isinstance(elem, tuple) and hasattr(elem, "_fields"):
             return type(elem)(*(self(s) for s in zip(*batch)))
+        elif isinstance(elem, Sequence) and all(isinstance(item, Data) for item in elem):   # Yufan modification
+            print('Yufan modification')
+            return batch
         elif isinstance(elem, Sequence) and not isinstance(elem, str):
             return [self(s) for s in zip(*batch)]
-
+        
         raise TypeError(f"DataLoader found invalid type: {type(elem)}")
 
     def collate(self, batch):  # Deprecated...

@@ -119,6 +119,15 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         "--outdim_globpar", help="Yufan: lens of global parameters for NNxTB output", type=int, default=24
     )
     parser.add_argument(
+        "--half_range_pt", help="Yufan: lens of scaling factors for NNxTB output", type=float, nargs='+'
+    )
+    parser.add_argument(
+        "--half_range_pt_globpar", help="Yufan: lens of scaling factors for NNxTB output", type=float, nargs='+'
+    )
+
+    
+    
+    parser.add_argument(
         "--r_max", help="distance cutoff (in Ang)", type=float, default=5.0
     )
     parser.add_argument(

@@ -193,7 +193,9 @@ def _build_model(
             radial_type=args.radial_type,
             heads=heads,
             outdim=args.outdim,
-            outdim_globpar=args.outdim_globpar
+            outdim_globpar=args.outdim_globpar,
+            half_range_pt=args.half_range_pt,
+            half_range_pt_globpar=args.half_range_pt_globpar
         )
     if args.model == "FoundationMACE":
         return modules.ScaleShiftMACE(**model_config_foundation)

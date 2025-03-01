@@ -541,8 +541,8 @@ class ScaleShiftMACExTB(MACE):
         atomic_inter_shift: float,
         outdim: int,
         outdim_globpar: int,
-        half_range_pt: Optional[torch.Tensor] = None,
-        half_range_pt_globpar: Optional[torch.Tensor] = None,
+        half_range_pt = None,
+        half_range_pt_globpar = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -556,11 +556,11 @@ class ScaleShiftMACExTB(MACE):
         
         if half_range_pt is None:
             half_range_pt = torch.Tensor([0.05] * self.outdim)
-        self.half_range_pt = half_range_pt
+        self.half_range_pt = torch.Tensor(half_range_pt)
         
         if half_range_pt_globpar is None:
             half_range_pt_globpar = torch.Tensor([0.05] * self.outdim_globpar)
-        self.half_range_pt_globpar = half_range_pt_globpar
+        self.half_range_pt_globpar = torch.Tensor(half_range_pt_globpar)
 
         
         # Define separate output heads for each dimension of the output
@@ -587,7 +587,8 @@ class ScaleShiftMACExTB(MACE):
             )
             self.output_globpar_heads.append(head)
 
-        self.out = PlusMinusSqrtIdentity()
+        # self.out = PlusMinusSqrtIdentity()
+        self.out = nn.Identity()
 
     def forward(
         self,
