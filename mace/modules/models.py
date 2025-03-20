@@ -696,8 +696,10 @@ class ScaleShiftMACExTB(MACE):
         if len(outputs) > 0:
             # Concatenate outputs and apply half_range_pt
             params_pred = torch.cat(outputs, dim=1) 
+            # Ensure half_range_pt is on the same device as params_pred
+            half_range_pt_device = self.half_range_pt.to(params_pred.device)
             # shrink the output
-            params_pred = self.out(params_pred) * self.half_range_pt
+            params_pred = self.out(params_pred) * half_range_pt_device
         else:
             params_pred = None
 
@@ -715,8 +717,10 @@ class ScaleShiftMACExTB(MACE):
         if len(outputs_globpar) > 0:
             # Concatenate outputs and apply half_range_pt_globpar
             outputs_globpar = torch.cat(outputs_globpar, dim=1)         # check output shape
+            # Ensure half_range_pt_globpar is on the same device as outputs_globpar
+            half_range_pt_globpar_device = self.half_range_pt_globpar.to(outputs_globpar.device)
             # shrink the output
-            outputs_globpar = self.out(outputs_globpar) * self.half_range_pt_globpar
+            outputs_globpar = self.out(outputs_globpar) * half_range_pt_globpar_device
         else:
             outputs_globpar = None
          
