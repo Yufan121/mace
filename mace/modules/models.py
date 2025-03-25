@@ -688,7 +688,7 @@ class ScaleShiftMACExTB(MACE):
         # node_attr is the element types 
         
         # Concatenate node features
-        node_feats_out = torch.cat(node_feats_list, dim=-1)
+        node_feats_out = torch.cat(node_feats_list, dim=-1) # [num_atoms*n_batch, len(features)]
         # Pass through separate output heads
         outputs = []
         for head in self.output_heads:
@@ -707,8 +707,9 @@ class ScaleShiftMACExTB(MACE):
             params_pred = params_pred[output_indices]
 
 
-        # Sum global features
-        global_feats = torch.sum(node_feats_out, dim=0).unsqueeze(0)  # [1, len(features)]
+        # Sum global features per batch
+        global_feats = scatter_sum(src=node_feats_out, index=data["batch"], dim=0, dim_size=num_graphs)  # [num_graphs, len(features)]
+        
         # Pass through separate output heads
         outputs_globpar = []
         for head in self.output_globpar_heads:
