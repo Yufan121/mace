@@ -13,7 +13,7 @@ from e3nn.util.jit import compile_mode
 
 from mace.data import AtomicData
 from mace.modules.radial import ZBLBasis
-from mace.tools.scatter import scatter_sum
+from mace.tools.scatter import scatter_sum, scatter_mean
 
 from .blocks import (
     AtomicEnergiesBlock,
@@ -707,8 +707,8 @@ class ScaleShiftMACExTB(MACE):
             params_pred = params_pred[output_indices]
 
 
-        # Sum global features per batch
-        global_feats = scatter_sum(src=node_feats_out, index=data["batch"], dim=0, dim_size=num_graphs)  # [num_graphs, len(features)]
+        # Average global features per batch
+        global_feats = scatter_mean(src=node_feats_out, index=data["batch"], dim=0, dim_size=num_graphs)  # [num_graphs, len(features)]
         
         # Pass through separate output heads
         outputs_globpar = []
