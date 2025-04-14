@@ -541,8 +541,13 @@ class ScaleShiftMACExTB(MACE):
         atomic_inter_shift: float,
         outdim: int,
         outdim_globpar: int,
+        outdim_pair: int,
         half_range_pt = None,
         half_range_pt_globpar = None,
+        half_range_pt_pair = None,
+        parallel_units_elempar: int = 64,
+        parallel_units_globpar: int = 64,
+        parallel_units_pair: int = 64,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -551,8 +556,10 @@ class ScaleShiftMACExTB(MACE):
         )
         self.outdim = outdim
         self.outdim_globpar = outdim_globpar
-        self.parallel_units = 64
-        self.parallel_units_globpar = 128
+        self.outdim_pair = outdim_pair
+        self.parallel_units_elempar = parallel_units_elempar
+        self.parallel_units_globpar = parallel_units_globpar
+        self.parallel_units_pair = parallel_units_pair
         
         if half_range_pt is None:
             half_range_pt = torch.Tensor([0.05] * self.outdim)
@@ -562,16 +569,22 @@ class ScaleShiftMACExTB(MACE):
             half_range_pt_globpar = torch.Tensor([0.05] * self.outdim_globpar)
         self.half_range_pt_globpar = torch.Tensor(half_range_pt_globpar)
 
+        if half_range_pt_pair is None:
+            half_range_pt_pair = torch.Tensor([0.05] * self.outdim_pair)
+        self.half_range_pt_pair = torch.Tensor(half_range_pt_pair)
+
+        # connecting layer size
+        cnt_size = 64
         
         # Define separate output heads for each dimension of the output
         self.output_heads = nn.ModuleList()
         for _ in range(self.outdim):
             head = nn.Sequential(
-                ResidualBlock(64, self.parallel_units),
-                # ResidualBlock(1632, self.parallel_units), 
-                ResidualBlock(self.parallel_units, self.parallel_units),
-                ResidualBlock(self.parallel_units, self.parallel_units),
-                nn.Linear(self.parallel_units, 1)
+                ResidualBlock(cnt_size, self.parallel_units_elempar),
+                # ResidualBlock(1632, self.parallel_units_elempar), 
+                ResidualBlock(self.parallel_units_elempar, self.parallel_units_elempar),
+                ResidualBlock(self.parallel_units_elempar, self.parallel_units_elempar),
+                nn.Linear(self.parallel_units_elempar, 1)
             )
             self.output_heads.append(head)
 
@@ -579,13 +592,24 @@ class ScaleShiftMACExTB(MACE):
         self.output_globpar_heads = nn.ModuleList()
         for _ in range(self.outdim_globpar):
             head = nn.Sequential(
-                ResidualBlockBS1(64, self.parallel_units_globpar),
+                ResidualBlockBS1(cnt_size, self.parallel_units_globpar),
                 # ResidualBlock(1632, self.parallel_units_globpar), 
                 ResidualBlockBS1(self.parallel_units_globpar, self.parallel_units_globpar),
                 ResidualBlockBS1(self.parallel_units_globpar, self.parallel_units_globpar),
                 nn.Linear(self.parallel_units_globpar, 1)
             )
             self.output_globpar_heads.append(head)
+
+        # pair parameters
+        self.output_pair_heads = nn.ModuleList()
+        for _ in range(self.outdim_pair):
+            head = nn.Sequential(
+                ResidualBlock(cnt_size, self.parallel_units_pair),
+                ResidualBlock(self.parallel_units_pair, self.parallel_units_pair),
+                ResidualBlock(self.parallel_units_pair, self.parallel_units_pair),
+                nn.Linear(self.parallel_units_pair, 1)
+            )
+            self.output_pair_heads.append(head)
 
         # self.out = PlusMinusSqrtIdentity()
         self.out = nn.Identity()
@@ -678,17 +702,17 @@ class ScaleShiftMACExTB(MACE):
 
         # Yufan: node_es_list, shape (3, num_atoms*n_batch)
         # Yufan: node_feats_list, shape (num_atoms*n_batch, len(features))
-        
         # use ResidualBlock to get separate output heads for each feature
         # from node_feats_list
-        
         # ignore node_es_list for now
         # node_feats_list
-        
         # node_attr is the element types 
+        
         
         # Concatenate node features
         node_feats_out = torch.cat(node_feats_list, dim=-1) # [num_atoms*n_batch, len(features)]
+        
+        ### ELEM PARAMS ###
         # Pass through separate output heads
         outputs = []
         for head in self.output_heads:
@@ -707,9 +731,10 @@ class ScaleShiftMACExTB(MACE):
             params_pred = params_pred[output_indices]
 
 
+
+        ### GLOBAL PARAMS ###
         # Average global features per batch
         global_feats = scatter_mean(src=node_feats_out, index=data["batch"], dim=0, dim_size=num_graphs)  # [num_graphs, len(features)]
-        
         # Pass through separate output heads
         outputs_globpar = []
         for head in self.output_globpar_heads:
@@ -724,50 +749,57 @@ class ScaleShiftMACExTB(MACE):
             outputs_globpar = self.out(outputs_globpar) * half_range_pt_globpar_device
         else:
             outputs_globpar = None
-         
-         
-        # # Concatenate node features
-        # node_feats_out = torch.cat(node_feats_list, dim=-1)
-        # # Sum over interactions
-        # node_inter_es = torch.sum(  
-        #     torch.stack(node_es_list, dim=0), dim=0
-        # )  # [n_nodes, ]
-        # node_inter_es = self.scale_shift(node_inter_es, node_heads)
 
-        # # Sum over nodes in graph
-        # inter_e = scatter_sum(
-        #     src=node_inter_es, index=data["batch"], dim=-1, dim_size=num_graphs
-        # )  # [n_graphs,]
 
-        # # Add E_0 and (scaled) interaction energy
-        # total_energy = e0 + inter_e
-        # node_energy = node_e0 + node_inter_es
-        
-        
-        
-        # forces, virials, stress, hessian = get_outputs(
-        #     energy=inter_e,
-        #     positions=data["positions"],
-        #     displacement=displacement,
-        #     cell=data["cell"],
-        #     training=training,
-        #     compute_force=compute_force,
-        #     compute_virials=compute_virials,
-        #     compute_stress=compute_stress,
-        #     compute_hessian=compute_hessian,
-        # )
+        ### PAIR PARAMS ###
+        # Compute pair parameters only if outdim_pair > 0
+        pair_params = []
+        if self.outdim_pair > 0:
+            for graph_idx in range(num_graphs):
+                # Get the indices for the current graph
+                start_idx = data['ptr'][graph_idx].item()
+                end_idx = data['ptr'][graph_idx + 1].item()
+                num_atoms = end_idx - start_idx
+
+                # Get the node features for the current graph
+                graph_node_feats = node_feats_out[start_idx:end_idx]
+
+                # print(f"graph_node_feats: {graph_node_feats}")
+
+                # Compute pairwise combinations TODO: check if this is correct
+                # pairwise_feats = torch.cat([
+                #     graph_node_feats.unsqueeze(1).expand(-1, num_atoms, -1),
+                #     graph_node_feats.unsqueeze(0).expand(num_atoms, -1, -1)
+                # ], dim=-1).reshape(num_atoms * num_atoms, -1)
+
+                # Instead of concatenating, sum the node features for each pair
+                pairwise_feats = graph_node_feats.unsqueeze(0).expand(num_atoms, -1, -1) + graph_node_feats.unsqueeze(1).expand(-1, num_atoms, -1)
+                pairwise_feats = pairwise_feats.reshape(num_atoms * num_atoms, -1)
+
+                # print(f"pairwise_feats: {pairwise_feats}")
+
+                # Pass through separate output heads
+                graph_pair_params = []
+                for head in self.output_pair_heads:
+                    graph_pair_params.append(head(pairwise_feats))
+
+                # Concatenate outputs
+                graph_pair_params = torch.cat(graph_pair_params, dim=1)
+                
+                # make it a 1D tensor
+                graph_pair_params = graph_pair_params.squeeze(-1)
+                
+                # shrink the output
+                half_range_pt_pair_device = self.half_range_pt_pair.to(graph_pair_params.device)
+                graph_pair_params = self.out(graph_pair_params) * half_range_pt_pair_device
+                
+                pair_params.append(graph_pair_params)
+
         output = {
-            # "energy": total_energy,
-            # "node_energy": node_energy,
-            # "interaction_energy": inter_e,
-            # "forces": forces,
-            # "virials": virials,
-            # "stress": stress,
-            # "hessian": hessian,
-            # "displacement": displacement,
             "params_pred": params_pred,
             "globpars_pred": outputs_globpar,
             "node_feats": node_feats_out,
+            "pair_param": pair_params,
         }
 
         return output
