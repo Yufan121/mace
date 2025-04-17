@@ -794,6 +794,9 @@ class ScaleShiftMACExTB(MACE):
                 graph_pair_params = self.out(graph_pair_params) * half_range_pt_pair_device
                 
                 pair_params.append(graph_pair_params)
+                
+            # Concatenate pair parameters
+            pair_params = torch.cat(pair_params, dim=0)
 
         output = {
             "params_pred": params_pred,
