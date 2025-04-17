@@ -795,8 +795,8 @@ class ScaleShiftMACExTB(MACE):
                 
                 pair_params.append(graph_pair_params)
                 
-            # Concatenate pair parameters
-            pair_params = torch.cat(pair_params, dim=0)
+            # Concatenate pair parameters to a single tensor with 3 dimensions
+            pair_params = torch.stack(pair_params, dim=0)
 
         output = {
             "params_pred": params_pred,
