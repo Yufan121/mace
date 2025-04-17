@@ -797,9 +797,9 @@ class ScaleShiftMACExTB(MACE):
                 
             # Concatenate pair parameters to a single tensor with 3 dimensions
             pair_params = torch.stack(pair_params, dim=0)
-            # if ndim is 2, add a dimension
+            # if ndim is 2, add a dimension in the middle
             if pair_params.ndim == 2:
-                pair_params = pair_params.unsqueeze(0)
+                pair_params = pair_params.unsqueeze(1)
 
         output = {
             "params_pred": params_pred,
