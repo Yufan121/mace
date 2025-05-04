@@ -8,7 +8,9 @@ from abc import abstractmethod
 from typing import Callable, List, Optional, Tuple, Union
 
 import numpy as np
+import torch
 import torch.nn.functional
+import e3nn
 from e3nn import nn, o3
 from e3nn.util.jit import compile_mode
 
@@ -592,6 +594,117 @@ class RealAgnosticInteractionBlock(InteractionBlock):
         )  # [n_nodes, channels, (lmax + 1)**2]
 
 
+# @compile_mode("script")
+# class RealAgnosticResidualInteractionBlock(InteractionBlock):
+#     # def __init__(
+#     #     self,
+#     #     node_attrs_irreps: o3.Irreps,
+#     #     node_feats_irreps: o3.Irreps,
+#     #     edge_attrs_irreps: o3.Irreps,
+#     #     edge_feats_irreps: o3.Irreps,
+#     #     target_irreps: o3.Irreps,
+#     #     hidden_irreps: o3.Irreps,
+#     #     avg_num_neighbors: float,
+#     #     radial_MLP: Optional[List[int]] = None,
+#     #     use_layer_norm: bool = False,
+#     # ) -> None:
+#     #     self.use_layer_norm = use_layer_norm
+#     #     super().__init__(
+#     #         node_attrs_irreps=node_attrs_irreps,
+#     #         node_feats_irreps=node_feats_irreps,
+#     #         edge_attrs_irreps=edge_attrs_irreps,
+#     #         edge_feats_irreps=edge_feats_irreps,
+#     #         target_irreps=target_irreps,
+#     #         hidden_irreps=hidden_irreps,
+#     #         avg_num_neighbors=avg_num_neighbors,
+#     #         radial_MLP=radial_MLP,
+#     #     )
+
+#     def _setup(self) -> None:
+#         # First linear
+#         self.linear_up = o3.Linear(
+#             self.node_feats_irreps,
+#             self.node_feats_irreps,
+#             internal_weights=True,
+#             shared_weights=True,
+#         )
+#         # TensorProduct
+#         irreps_mid, instructions = tp_out_irreps_with_instructions(
+#             self.node_feats_irreps,
+#             self.edge_attrs_irreps,
+#             self.target_irreps,
+#         )
+#         self.conv_tp = o3.TensorProduct(
+#             self.node_feats_irreps,
+#             self.edge_attrs_irreps,
+#             irreps_mid,
+#             instructions=instructions,
+#             shared_weights=False,
+#             internal_weights=False,
+#         )
+
+#         # Convolution weights
+#         input_dim = self.edge_feats_irreps.num_irreps
+#         self.conv_tp_weights = nn.FullyConnectedNet(
+#             [input_dim] + self.radial_MLP + [self.conv_tp.weight_numel],
+#             torch.nn.functional.silu,  # gate
+#         )
+
+#         # Linear
+#         irreps_mid = irreps_mid.simplify()
+#         self.irreps_out = self.target_irreps
+#         self.linear = o3.Linear(
+#             irreps_mid, self.irreps_out, internal_weights=True, shared_weights=True
+#         )
+
+#         # Selector TensorProduct
+#         self.skip_tp = o3.FullyConnectedTensorProduct(
+#             self.node_feats_irreps, self.node_attrs_irreps, self.hidden_irreps
+#         )
+#         self.reshape = reshape_irreps(self.irreps_out)
+
+#         # # Optional LayerNorm
+#         # self.norm = None
+#         # if self.use_layer_norm:
+#         #     # total feature dimension for layer normalization
+#         #     # dim = self.reshape.dim
+#         #     # self.norm = torch.nn.LayerNorm(dim)
+#         #     print(f"self.irreps_out: {self.irreps_out}")
+#         #     self.norm = e3nn.nn.NormActivation(self.irreps_out, torch.nn.Identity(), bias=True)
+
+#     def forward(
+#         self,
+#         node_attrs: torch.Tensor,
+#         node_feats: torch.Tensor,
+#         edge_attrs: torch.Tensor,
+#         edge_feats: torch.Tensor,
+#         edge_index: torch.Tensor,
+#     ) -> Tuple[torch.Tensor, torch.Tensor]:
+#         sender = edge_index[0]
+#         receiver = edge_index[1]
+#         num_nodes = node_feats.shape[0]
+#         sc = self.skip_tp(node_feats, node_attrs)
+#         node_feats = self.linear_up(node_feats)
+#         tp_weights = self.conv_tp_weights(edge_feats)
+#         mji = self.conv_tp(
+#             node_feats[sender], edge_attrs, tp_weights
+#         )  # [n_edges, irreps]
+#         message = scatter_sum(
+#             src=mji, index=receiver, dim=0, dim_size=num_nodes
+#         )  # [n_nodes, irreps]
+
+#         # # Optional LayerNorm after aggregation: Yufan
+#         # if self.use_layer_norm and self.norm is not None:
+#         #     print(f"message shape: {message.shape}")
+#         #     message = self.norm(message)
+
+#         # 
+#         message = self.linear(message / self.avg_num_neighbors)  # [n_nodes, irreps]
+
+#         return message, sc  # [n_nodes, channels, (lmax + 1)**2]
+
+
+
 @compile_mode("script")
 class RealAgnosticResidualInteractionBlock(InteractionBlock):
     def _setup(self) -> None:
@@ -662,6 +775,7 @@ class RealAgnosticResidualInteractionBlock(InteractionBlock):
             self.reshape(message),
             sc,
         )  # [n_nodes, channels, (lmax + 1)**2]
+
 
 
 @compile_mode("script")

@@ -188,6 +188,12 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         ],
     )
     parser.add_argument(
+        "--interaction_use_layer_norm",
+        help="Use LayerNorm after message aggregation in interaction blocks that support it",
+        type=str2bool,
+        default=True,
+    )
+    parser.add_argument(
         "--max_ell", help=r"highest \ell of spherical harmonics", type=int, default=3
     )
     parser.add_argument(

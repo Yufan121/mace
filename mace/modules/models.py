@@ -15,6 +15,8 @@ from mace.data import AtomicData
 from mace.modules.radial import ZBLBasis
 from mace.tools.scatter import scatter_sum, scatter_mean
 
+import os
+
 from .blocks import (
     AtomicEnergiesBlock,
     EquivariantProductBasisBlock,
@@ -62,6 +64,7 @@ class MACE(torch.nn.Module):
         radial_MLP: Optional[List[int]] = None,
         radial_type: Optional[str] = "bessel",
         heads: Optional[List[str]] = None,
+        # use_layer_norm: Optional[bool] = False,
     ):
         super().__init__()
         self.register_buffer(
@@ -116,6 +119,7 @@ class MACE(torch.nn.Module):
             hidden_irreps=hidden_irreps,
             avg_num_neighbors=avg_num_neighbors,
             radial_MLP=radial_MLP,
+            # use_layer_norm=use_layer_norm,
         )
         self.interactions = torch.nn.ModuleList([inter])
 
@@ -155,6 +159,7 @@ class MACE(torch.nn.Module):
                 hidden_irreps=hidden_irreps_out,
                 avg_num_neighbors=avg_num_neighbors,
                 radial_MLP=radial_MLP,
+                # use_layer_norm=use_layer_norm,
             )
             self.interactions.append(inter)
             prod = EquivariantProductBasisBlock(
@@ -189,6 +194,8 @@ class MACE(torch.nn.Module):
         compute_stress: bool = False,
         compute_displacement: bool = False,
         compute_hessian: bool = False,
+        save_intermediate: bool = False,
+        save_dir: str = "./tsne_features",
     ) -> Dict[str, Optional[torch.Tensor]]:
         # Setup
         data["node_attrs"].requires_grad_(True)
@@ -223,7 +230,7 @@ class MACE(torch.nn.Module):
         node_e0 = self.atomic_energies_fn(data["node_attrs"])[
             num_atoms_arange, node_heads
         ]
-        e0 = scatter_sum(
+        e0 = scatter_sum(   # scatter_sum: sum over the nodes in the graph
             src=node_e0, index=data["batch"], dim=0, dim_size=num_graphs
         )  # [n_graphs, n_heads]
         # Embeddings
@@ -252,9 +259,7 @@ class MACE(torch.nn.Module):
         energies = [e0, pair_energy]
         node_energies_list = [node_e0, pair_node_energy]
         node_feats_list = []
-        for interaction, product, readout in zip(
-            self.interactions, self.products, self.readouts
-        ):
+        for i, (interaction, product, readout) in enumerate(zip(self.interactions, self.products, self.readouts)):
             node_feats, sc = interaction(
                 node_attrs=data["node_attrs"],
                 node_feats=node_feats,
@@ -279,6 +284,10 @@ class MACE(torch.nn.Module):
             )  # [n_graphs,]
             energies.append(energy)
             node_energies_list.append(node_energies)
+            if save_intermediate:
+                # Save each layer's node features as a numpy file
+                np.save(f"{save_dir}/layer_{i}_node_feats.npy", node_feats.detach().cpu().numpy())
+
         # Concatenate node features
         node_feats_out = torch.cat(node_feats_list, dim=-1)
 
@@ -336,6 +345,8 @@ class ScaleShiftMACE(MACE):
         compute_stress: bool = False,
         compute_displacement: bool = False,
         compute_hessian: bool = False,
+        save_intermediate: bool = False,
+        save_dir: str = "./tsne_features",
     ) -> Dict[str, Optional[torch.Tensor]]:
         # Setup
         data["positions"].requires_grad_(True)
@@ -394,9 +405,7 @@ class ScaleShiftMACE(MACE):
         # Interactions
         node_es_list = [pair_node_energy]
         node_feats_list = []
-        for interaction, product, readout in zip(
-            self.interactions, self.products, self.readouts
-        ):
+        for i, (interaction, product, readout) in enumerate(zip(self.interactions, self.products, self.readouts)):
             node_feats, sc = interaction(
                 node_attrs=data["node_attrs"],
                 node_feats=node_feats,
@@ -411,6 +420,9 @@ class ScaleShiftMACE(MACE):
             node_es_list.append(
                 readout(node_feats, node_heads)[num_atoms_arange, node_heads]
             )  # {[n_nodes, ], }
+            if save_intermediate:
+                # Save each layer's node features as a numpy file
+                np.save(f"{save_dir}/layer_{i}_node_feats.npy", node_feats.detach().cpu().numpy())
 
         # Concatenate node features
         node_feats_out = torch.cat(node_feats_list, dim=-1)
@@ -426,7 +438,7 @@ class ScaleShiftMACE(MACE):
         )  # [n_graphs,]
 
         # Add E_0 and (scaled) interaction energy
-        total_energy = e0 + inter_e
+        total_e = e0 + inter_e
         node_energy = node_e0 + node_inter_es
         forces, virials, stress, hessian = get_outputs(
             energy=inter_e,
@@ -440,7 +452,7 @@ class ScaleShiftMACE(MACE):
             compute_hessian=compute_hessian,
         )
         output = {
-            "energy": total_energy,
+            "energy": total_e,
             "node_energy": node_energy,
             "interaction_energy": inter_e,
             "forces": forces,
@@ -461,10 +473,11 @@ class ResidualBlock(nn.Module):
     def __init__(self, input_dim, output_dim):
         super(ResidualBlock, self).__init__()
         self.fc = nn.Linear(input_dim, output_dim)
-        self.bn = nn.BatchNorm1d(output_dim)
+        self.ln = nn.LayerNorm(output_dim)
         # self.activation = nn.Tanh()  # You can replace this with F.relu or other activation functions
         # self.activation = F.relu  # LeakyReLU  
-        self.activation = nn.LeakyReLU(negative_slope=0.01)        
+        # self.activation = nn.LeakyReLU(negative_slope=0.01)        
+        self.activation = nn.SiLU()
         
         # Add a linear layer to match dimensions if needed
         if input_dim != output_dim:
@@ -475,8 +488,7 @@ class ResidualBlock(nn.Module):
     def forward(self, x):
         residual = x
         out = self.fc(x)
-        if x.size(0) > 1:
-            out = self.bn(out)
+        out = self.ln(out)
         out = self.activation(out)
         
         if self.match_dim is not None:
@@ -487,36 +499,36 @@ class ResidualBlock(nn.Module):
         return out
     
     
-class ResidualBlockBS1(nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super(ResidualBlockBS1, self).__init__()    
-        self.fc = nn.Linear(input_dim, output_dim)
-        self.in_norm = nn.InstanceNorm1d(output_dim)
-        # self.activation = nn.Tanh()  # You can replace this with F.relu or other activation functions
-        # self.activation = F.relu   
-        self.activation = nn.LeakyReLU(negative_slope=0.01)        
- 
-        # Add a linear layer to match dimensions if needed
-        if input_dim != output_dim:
-            self.match_dim = nn.Linear(input_dim, output_dim)
-        else:
-            self.match_dim = None
+# class ResidualBlockBS1(nn.Module):
+#     def __init__(self, input_dim, output_dim):
+#         super(ResidualBlockBS1, self).__init__()    
+#         self.fc = nn.Linear(input_dim, output_dim)
+#         self.ln = nn.LayerNorm(output_dim)
+#         # self.activation = nn.Tanh()  # You can replace this with F.relu or other activation functions
+#         # self.activation = F.relu   
+#         # self.activation = nn.LeakyReLU(negative_slope=0.01)        
+#         self.activation = nn.SiLU()
+        
+#         # Add a linear layer to match dimensions if needed
+#         if input_dim != output_dim:
+#             self.match_dim = nn.Linear(input_dim, output_dim)
+#         else:
+#             self.match_dim = None
 
-    def forward(self, x):
-        residual = x
-        out = self.fc(x)
+#     def forward(self, x):
+#         residual = x
+#         out = self.fc(x)
         
-        # Apply instance normalization
-        out = self.in_norm(out.unsqueeze(0)).squeeze(0)
+#         out = self.ln(out)
         
-        out = self.activation(out)
+#         out = self.activation(out)
         
-        if self.match_dim is not None:
-            residual = self.match_dim(residual)
+#         if self.match_dim is not None:
+#             residual = self.match_dim(residual)
         
-        out = out + residual  # Use out-of-place addition        
+#         out = out + residual  # Use out-of-place addition        
         
-        return out
+#         return out
 
 class PlusMinusSqrtIdentity(nn.Module):
     def forward(self, x):
@@ -545,74 +557,116 @@ class ScaleShiftMACExTB(MACE):
         half_range_pt = None,
         half_range_pt_globpar = None,
         half_range_pt_pair = None,
-        parallel_units_elempar: int = 64,
-        parallel_units_globpar: int = 64,
-        parallel_units_pair: int = 64,
+        parallel_units_elempar: int = 640,
+        parallel_units_globpar: int = 640,
+        parallel_units_pair: int = 640,
+        separate_output_heads: bool = True,
         **kwargs,
     ):
         super().__init__(**kwargs)
+        # Initialize scale and shift block
         self.scale_shift = ScaleShiftBlock(
             scale=atomic_inter_scale, shift=atomic_inter_shift
         )
+        
+        # Set output dimensions
         self.outdim = outdim
         self.outdim_globpar = outdim_globpar
         self.outdim_pair = outdim_pair
+        
+        elemnet = False
+        globnet = False
+        pairnet = False
+        if self.outdim > 0:
+            elemnet = True
+        if self.outdim_globpar > 0:
+            globnet = True
+        if self.outdim_pair > 0:
+            pairnet = True
+        self.elemnet = elemnet
+        self.globnet = globnet
+        self.pairnet = pairnet  
+        
+        # only one of the three can be True
+        assert sum([elemnet, globnet, pairnet]) == 1, "Only one of the three can be True"
+        
+        
+        # Set parallel units
         self.parallel_units_elempar = parallel_units_elempar
         self.parallel_units_globpar = parallel_units_globpar
         self.parallel_units_pair = parallel_units_pair
+        self.separate_output_heads = separate_output_heads
         
-        if half_range_pt is None:
-            half_range_pt = torch.Tensor([0.05] * self.outdim)
-        self.half_range_pt = torch.Tensor(half_range_pt)
+        # Initialize half range parameters
+        self.half_range_pt = torch.Tensor(half_range_pt or [0.05] * self.outdim)
+        self.half_range_pt_globpar = torch.Tensor(half_range_pt_globpar or [0.05] * self.outdim_globpar)
+        self.half_range_pt_pair = torch.Tensor(half_range_pt_pair or [0.05] * self.outdim_pair)
+
+        # Define connecting layer size
+        cnt_size = 128 + 100        # TODO
         
-        if half_range_pt_globpar is None:
-            half_range_pt_globpar = torch.Tensor([0.05] * self.outdim_globpar)
-        self.half_range_pt_globpar = torch.Tensor(half_range_pt_globpar)
-
-        if half_range_pt_pair is None:
-            half_range_pt_pair = torch.Tensor([0.05] * self.outdim_pair)
-        self.half_range_pt_pair = torch.Tensor(half_range_pt_pair)
-
-        # connecting layer size
-        cnt_size = 64
-        
-        # Define separate output heads for each dimension of the output
-        self.output_heads = nn.ModuleList()
-        for _ in range(self.outdim):
-            head = nn.Sequential(
-                ResidualBlock(cnt_size, self.parallel_units_elempar),
-                # ResidualBlock(1632, self.parallel_units_elempar), 
-                ResidualBlock(self.parallel_units_elempar, self.parallel_units_elempar),
-                ResidualBlock(self.parallel_units_elempar, self.parallel_units_elempar),
-                nn.Linear(self.parallel_units_elempar, 1)
-            )
-            self.output_heads.append(head)
-
-        # globpar
-        self.output_globpar_heads = nn.ModuleList()
-        for _ in range(self.outdim_globpar):
-            head = nn.Sequential(
-                ResidualBlockBS1(cnt_size, self.parallel_units_globpar),
-                # ResidualBlock(1632, self.parallel_units_globpar), 
-                ResidualBlockBS1(self.parallel_units_globpar, self.parallel_units_globpar),
-                ResidualBlockBS1(self.parallel_units_globpar, self.parallel_units_globpar),
-                nn.Linear(self.parallel_units_globpar, 1)
-            )
-            self.output_globpar_heads.append(head)
-
-        # pair parameters
-        self.output_pair_heads = nn.ModuleList()
-        for _ in range(self.outdim_pair):
-            head = nn.Sequential(
-                ResidualBlock(cnt_size, self.parallel_units_pair),
-                ResidualBlock(self.parallel_units_pair, self.parallel_units_pair),
-                ResidualBlock(self.parallel_units_pair, self.parallel_units_pair),
-                nn.Linear(self.parallel_units_pair, 1)
-            )
-            self.output_pair_heads.append(head)
-
-        # self.out = PlusMinusSqrtIdentity()
+        # Create output heads
+        if self.separate_output_heads:
+            self.output_heads = self._create_output_heads(self.outdim, self.parallel_units_elempar, cnt_size)
+            self.output_globpar_heads = self._create_output_heads(self.outdim_globpar, self.parallel_units_globpar, cnt_size) # Can switch to ResidualBlockBS1
+            self.output_pair_heads = self._create_output_heads(self.outdim_pair, self.parallel_units_pair, cnt_size)
+        else:
+            self.output_head = self._create_combined_head(self.outdim, self.parallel_units_elempar, cnt_size)
+            self.output_globpar_head = self._create_combined_head(self.outdim_globpar, self.parallel_units_globpar, cnt_size)
+            self.output_pair_head = self._create_combined_head(self.outdim_pair, self.parallel_units_pair, cnt_size)
+            
+        # Define output activation
         self.out = nn.Identity()
+
+        # Create scale and shift predictors
+        self.scale_predictor = self._create_predictor(cnt_size, self.outdim)
+        self.shift_predictor = self._create_predictor(cnt_size, self.outdim, use_softplus=False)
+        self.scale_predictor_globpar = self._create_predictor(cnt_size, self.outdim_globpar)
+        self.shift_predictor_globpar = self._create_predictor(cnt_size, self.outdim_globpar, use_softplus=False)
+
+    def _create_output_heads(self, outdim, parallel_units, cnt_size, block_type=ResidualBlock):
+        # Helper function to create separate output heads
+        return nn.ModuleList([
+            nn.Sequential(
+                block_type(cnt_size, parallel_units),
+                block_type(parallel_units, parallel_units),
+                block_type(parallel_units, parallel_units),
+                nn.Linear(parallel_units, 1)
+            ) for _ in range(outdim)
+        ])
+
+    def _create_combined_head(self, outdim, parallel_units, cnt_size):
+        # Helper function to create a combined output head
+        return nn.Sequential(
+            ResidualBlock(cnt_size, parallel_units),
+            ResidualBlock(parallel_units, parallel_units),
+            ResidualBlock(parallel_units, parallel_units),
+            nn.Linear(parallel_units, outdim)
+        )
+
+    def _create_predictor(self, cnt_size, outdim, use_softplus=True):
+        # Helper function to create a predictor
+        layers = [
+            nn.Linear(cnt_size, 64),
+            nn.Linear(64, 128),
+            nn.Linear(128, 128),
+            nn.Linear(128, outdim)
+        ]
+        if use_softplus:
+            layers.append(nn.Softplus())
+        return nn.Sequential(*layers)
+
+    def _print_grad_hook(self, grad: torch.Tensor, name: str):
+        # Helper function for gradient hooks
+        if grad is not None:
+            print(f"--- Gradient Stats for {name} ---")
+            print(f"  - Norm: {grad.norm().item():.4f}")
+            print(f"  - Mean: {grad.mean().item():.4f}")
+            print(f"  - Max Abs: {grad.abs().max().item():.4f}")
+            print(f"  - Has NaN: {torch.isnan(grad).any().item()}")
+            print(f"  - Has Inf: {torch.isinf(grad).any().item()}")
+        else:
+            print(f"--- No gradient computed for {name} ---")
 
     def forward(
         self,
@@ -623,29 +677,24 @@ class ScaleShiftMACExTB(MACE):
         compute_stress: bool = False,
         compute_displacement: bool = False,
         compute_hessian: bool = False,
-        output_indices = None, # if provided, only output output_indices's node features
+        output_indices = None,
+        save_intermediate: bool = False,    # TODO
+        save_dir: str = "./tsne_features",
     ) -> Dict[str, Optional[torch.Tensor]]:
-        # Setup
+        # Setup and gradient requirements
         data["positions"].requires_grad_(True)
         data["node_attrs"].requires_grad_(True)
+        print(f'node_attrs.shape: {data["node_attrs"].shape}, node_attrs: {data["node_attrs"]}')
         num_graphs = data["ptr"].numel() - 1
         num_atoms_arange = torch.arange(data["positions"].shape[0])
-        node_heads = (
-            data["head"][data["batch"]]
-            if "head" in data
-            else torch.zeros_like(data["batch"])
-        )
+        node_heads = data.get("head", torch.zeros_like(data["batch"]))[data["batch"]]
         displacement = torch.zeros(
             (num_graphs, 3, 3),
             dtype=data["positions"].dtype,
             device=data["positions"].device,
         )
         if compute_virials or compute_stress or compute_displacement:
-            (
-                data["positions"],
-                data["shifts"],
-                displacement,
-            ) = get_symmetric_displacement(
+            data["positions"], data["shifts"], displacement = get_symmetric_displacement(
                 positions=data["positions"],
                 unit_shifts=data["unit_shifts"],
                 cell=data["cell"],
@@ -654,15 +703,11 @@ class ScaleShiftMACExTB(MACE):
                 batch=data["batch"],
             )
 
-        # Atomic energies
-        node_e0 = self.atomic_energies_fn(data["node_attrs"])[
-            num_atoms_arange, node_heads
-        ]
-        e0 = scatter_sum(
-            src=node_e0, index=data["batch"], dim=0, dim_size=num_graphs
-        )  # [n_graphs, num_heads]
+        # Compute atomic energies
+        node_e0 = self.atomic_energies_fn(data["node_attrs"])[num_atoms_arange, node_heads]
+        e0 = scatter_sum(src=node_e0, index=data["batch"], dim=0, dim_size=num_graphs)
 
-        # Embeddings
+        # Compute embeddings and edge features
         node_feats = self.node_embedding(data["node_attrs"])
         vectors, lengths = get_edge_vectors_and_lengths(
             positions=data["positions"],
@@ -670,21 +715,13 @@ class ScaleShiftMACExTB(MACE):
             shifts=data["shifts"],
         )
         edge_attrs = self.spherical_harmonics(vectors)
-        edge_feats = self.radial_embedding(
-            lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers
-        )
-        if hasattr(self, "pair_repulsion"):
-            pair_node_energy = self.pair_repulsion_fn(
-                lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers
-            )
-        else:
-            pair_node_energy = torch.zeros_like(node_e0)
-        # Interactions
+        edge_feats = self.radial_embedding(lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers)
+        pair_node_energy = self.pair_repulsion_fn(lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers) if hasattr(self, "pair_repulsion") else torch.zeros_like(node_e0)
+
+        # Process interactions
         node_es_list = [pair_node_energy]
         node_feats_list = []
-        for interaction, product, readout in zip(
-            self.interactions, self.products, self.readouts
-        ):
+        for i, (interaction, product, readout) in enumerate(zip(self.interactions, self.products, self.readouts)):
             node_feats, sc = interaction(
                 node_attrs=data["node_attrs"],
                 node_feats=node_feats,
@@ -692,115 +729,119 @@ class ScaleShiftMACExTB(MACE):
                 edge_feats=edge_feats,
                 edge_index=data["edge_index"],
             )
-            node_feats = product(   # work on this
-                node_feats=node_feats, sc=sc, node_attrs=data["node_attrs"]
-            )
+            node_feats = product(node_feats=node_feats, sc=sc, node_attrs=data["node_attrs"])
             node_feats_list.append(node_feats)
-            node_es_list.append(
-                readout(node_feats, node_heads)[num_atoms_arange, node_heads]
-            )  # {[n_nodes, ], }
+            node_es_list.append(readout(node_feats, node_heads)[num_atoms_arange, node_heads])
 
-        # Yufan: node_es_list, shape (3, num_atoms*n_batch)
-        # Yufan: node_feats_list, shape (num_atoms*n_batch, len(features))
-        # use ResidualBlock to get separate output heads for each feature
-        # from node_feats_list
-        # ignore node_es_list for now
-        # node_feats_list
-        # node_attr is the element types 
+            if training:
+                node_feats_list[-1].register_hook(lambda grad: self._print_grad_hook(grad, f"node_feats_list[-1]"))
+                node_es_list[-1].register_hook(lambda grad: self._print_grad_hook(grad, f"node_es_list[-1]"))
+                
+            
+
+            if save_intermediate:
+                # Save each layer's node features as a numpy file
+                # make sure the directory exists
+                os.makedirs(save_dir, exist_ok=True)
+                if self.elemnet:
+                    np.save(f"{save_dir}/layer_{i}_elemnet_node_feats.npy", node_feats.detach().cpu().numpy())
+                elif self.globnet:
+                    np.save(f"{save_dir}/layer_{i}_globnet_node_feats.npy", node_feats.detach().cpu().numpy())
+                elif self.pairnet:
+                    np.save(f"{save_dir}/layer_{i}_pairnet_node_feats.npy", node_feats.detach().cpu().numpy())
+
+        # concatenate node features
+        # print(f'len(node_feats_list): {len(node_feats_list)}')
+        # for i in range(len(node_feats_list)):
+        #     print(f'node_feats_list[{i}].shape: {node_feats_list[i].shape}')
+        # # Concatenate node features
+        # node_feats_out = torch.cat(node_feats_list, dim=-1)
+        # print(f'node_feats_out.shape: {node_feats_out.shape}')
+        # if training and node_feats_out.requires_grad:
+        #     node_feats_out.register_hook(lambda grad: self._print_grad_hook(grad, "node_feats_out"))
+        # only use the last node features
+        node_feats_out = node_feats_list[-1]
+        print(f'node_feats_out.shape: {node_feats_out.shape}')
         
+        # concat with node_attrs # TODO
+        node_feats_out = torch.cat([node_feats_out, data["node_attrs"]], dim=-1)
         
-        # Concatenate node features
-        node_feats_out = torch.cat(node_feats_list, dim=-1) # [num_atoms*n_batch, len(features)]
+        print(f'node_feats_out.shape after concat: {node_feats_out.shape}')
         
-        ### ELEM PARAMS ###
-        # Pass through separate output heads
-        outputs = []
-        for head in self.output_heads:
-            outputs.append(head(node_feats_out))
-        if len(outputs) > 0:
-            # Concatenate outputs and apply half_range_pt
-            params_pred = torch.cat(outputs, dim=1) 
-            # Ensure half_range_pt is on the same device as params_pred
-            half_range_pt_device = self.half_range_pt.to(params_pred.device)
-            # shrink the output
-            params_pred = self.out(params_pred) * half_range_pt_device
+        # Predict scale and shift
+        scale = self.scale_predictor(node_feats_out)
+        shift = self.shift_predictor(node_feats_out)
+
+        #### Compute element parameters #### 
+        if self.separate_output_heads:
+            outputs = [head(node_feats_out) for head in self.output_heads]
+            params_pred_raw = torch.cat(outputs, dim=1) if outputs else None
         else:
-            params_pred = None
+            params_pred_raw = self.output_head(node_feats_out) if self.outdim > 0 else None
 
-        if output_indices is not None:
+        if training and params_pred_raw is not None and params_pred_raw.requires_grad:  # debug hook
+            params_pred_raw.register_hook(lambda grad: self._print_grad_hook(grad, "params_pred_raw"))
+            
+        # save params_pred_raw
+        if save_intermediate:
+            np.save(f"{save_dir}/params_pred_raw.npy", params_pred_raw.detach().cpu().numpy())
+
+        params_pred = params_pred_raw
+        if params_pred_raw is not None:
+            half_range_pt_device = self.half_range_pt.to(params_pred_raw.device)
+            params_pred = self.out(params_pred) * half_range_pt_device
+
+        if output_indices is not None and params_pred is not None:
             params_pred = params_pred[output_indices]
 
+        #### Compute global parameters #### 
+        global_feats = scatter_mean(src=node_feats_out, index=data["batch"], dim=0, dim_size=num_graphs)
 
+        scale_globpar = self.scale_predictor_globpar(global_feats)
+        shift_globpar = self.shift_predictor_globpar(global_feats)
 
-        ### GLOBAL PARAMS ###
-        # Average global features per batch
-        global_feats = scatter_mean(src=node_feats_out, index=data["batch"], dim=0, dim_size=num_graphs)  # [num_graphs, len(features)]
-        # Pass through separate output heads
-        outputs_globpar = []
-        for head in self.output_globpar_heads:
-            outputs_globpar.append(head(global_feats))
-        
-        if len(outputs_globpar) > 0:
-            # Concatenate outputs and apply half_range_pt_globpar
-            outputs_globpar = torch.cat(outputs_globpar, dim=1)         # check output shape
-            # Ensure half_range_pt_globpar is on the same device as outputs_globpar
-            half_range_pt_globpar_device = self.half_range_pt_globpar.to(outputs_globpar.device)
-            # shrink the output
-            outputs_globpar = self.out(outputs_globpar) * half_range_pt_globpar_device
+        if self.separate_output_heads:
+            outputs_globpar = [head(global_feats) for head in self.output_globpar_heads]
+            outputs_globpar_raw = torch.cat(outputs_globpar, dim=1) if outputs_globpar else None
         else:
-            outputs_globpar = None
+            outputs_globpar_raw = self.output_globpar_head(global_feats) if self.outdim_globpar > 0 else None
 
+        if training and outputs_globpar_raw is not None and outputs_globpar_raw.requires_grad: # debug hook
+            outputs_globpar_raw.register_hook(lambda grad: self._print_grad_hook(grad, "outputs_globpar_raw"))
 
-        ### PAIR PARAMS ###
-        # Compute pair parameters only if outdim_pair > 0
+        outputs_globpar = outputs_globpar_raw
+        if outputs_globpar_raw is not None:
+            half_range_pt_globpar_device = self.half_range_pt_globpar.to(outputs_globpar_raw.device)
+            outputs_globpar = self.out(outputs_globpar) * half_range_pt_globpar_device
+
+        #### Compute pair parameters #### 
         pair_params = []
         if self.outdim_pair > 0:
             for graph_idx in range(num_graphs):
-                # Get the indices for the current graph
                 start_idx = data['ptr'][graph_idx].item()
                 end_idx = data['ptr'][graph_idx + 1].item()
                 num_atoms = end_idx - start_idx
-
-                # Get the node features for the current graph
                 graph_node_feats = node_feats_out[start_idx:end_idx]
-
-                # print(f"graph_node_feats: {graph_node_feats}")
-
-                # Compute pairwise combinations TODO: check if this is correct
-                # pairwise_feats = torch.cat([
-                #     graph_node_feats.unsqueeze(1).expand(-1, num_atoms, -1),
-                #     graph_node_feats.unsqueeze(0).expand(num_atoms, -1, -1)
-                # ], dim=-1).reshape(num_atoms * num_atoms, -1)
-
-                # Instead of concatenating, sum the node features for each pair
                 pairwise_feats = graph_node_feats.unsqueeze(0).expand(num_atoms, -1, -1) + graph_node_feats.unsqueeze(1).expand(-1, num_atoms, -1)
                 pairwise_feats = pairwise_feats.reshape(num_atoms * num_atoms, -1)
 
-                # print(f"pairwise_feats: {pairwise_feats}")
+                if self.separate_output_heads:
+                    graph_pair_params = [head(pairwise_feats) for head in self.output_pair_heads]
+                    graph_pair_params = torch.cat(graph_pair_params, dim=1)
+                else:
+                    graph_pair_params = self.output_pair_head(pairwise_feats)
 
-                # Pass through separate output heads
-                graph_pair_params = []
-                for head in self.output_pair_heads:
-                    graph_pair_params.append(head(pairwise_feats))
-
-                # Concatenate outputs
-                graph_pair_params = torch.cat(graph_pair_params, dim=1)
-                
-                # make it a 1D tensor
-                graph_pair_params = graph_pair_params.squeeze(-1)
-                
-                # shrink the output
                 half_range_pt_pair_device = self.half_range_pt_pair.to(graph_pair_params.device)
                 graph_pair_params = self.out(graph_pair_params) * half_range_pt_pair_device
                 
                 pair_params.append(graph_pair_params)
-                
-            # Concatenate pair parameters to a single tensor with 3 dimensions
+            
             pair_params = torch.stack(pair_params, dim=0)
-            # if ndim is 2, add a dimension in the middle
             if pair_params.ndim == 2:
                 pair_params = pair_params.unsqueeze(1)
 
+
+        # Prepare output dictionary
         output = {
             "params_pred": params_pred,
             "globpars_pred": outputs_globpar,
@@ -910,6 +951,8 @@ class BOTNet(torch.nn.Module):
 
         # Interactions
         energies = [e0]
+        node_energies_list = [node_e0]
+        dipoles = []
         for interaction, readout in zip(self.interactions, self.readouts):
             node_feats = interaction(
                 node_attrs=data.node_attrs,
@@ -918,24 +961,66 @@ class BOTNet(torch.nn.Module):
                 edge_feats=edge_feats,
                 edge_index=data.edge_index,
             )
-            node_energies = readout(node_feats).squeeze(-1)  # [n_nodes, ]
+            node_feats = product(
+                node_feats=node_feats,
+                sc=sc,
+                node_attrs=data["node_attrs"],
+            )
+            node_out = readout(node_feats).squeeze(-1)  # [n_nodes, ]
+            # node_energies = readout(node_feats).squeeze(-1)  # [n_nodes, ]
+            node_energies = node_out[:, 0]
             energy = scatter_sum(
-                src=node_energies, index=data.batch, dim=-1, dim_size=data.num_graphs
+                src=node_energies, index=data["batch"], dim=-1, dim_size=data.num_graphs
             )  # [n_graphs,]
             energies.append(energy)
+            node_dipoles = node_out[:, 1:]
+            dipoles.append(node_dipoles)
 
-        # Sum over energy contributions
+        # Compute the energies and dipoles
         contributions = torch.stack(energies, dim=-1)
         total_energy = torch.sum(contributions, dim=-1)  # [n_graphs, ]
+        node_energy_contributions = torch.stack(node_energies_list, dim=-1)
+        node_energy = torch.sum(node_energy_contributions, dim=-1)  # [n_nodes, ]
+        contributions_dipoles = torch.stack(
+            dipoles, dim=-1
+        )  # [n_nodes,3,n_contributions]
+        atomic_dipoles = torch.sum(contributions_dipoles, dim=-1)  # [n_nodes,3]
+        total_dipole = scatter_sum(
+            src=atomic_dipoles,
+            index=data["batch"].unsqueeze(-1),
+            dim=0,
+            dim_size=data.num_graphs,
+        )  # [n_graphs,3]
+        baseline = compute_fixed_charge_dipole(
+            charges=data["charges"],
+            positions=data["positions"],
+            batch=data["batch"],
+            num_graphs=data.num_graphs,
+        )  # [n_graphs,3]
+        total_dipole = total_dipole + baseline
+
+        forces, virials, stress, _ = get_outputs(
+            energy=total_energy,
+            positions=data["positions"],
+            displacement=data["shifts"],
+            cell=data["cell"],
+            training=training,
+            compute_force=True,
+            compute_virials=True,
+            compute_stress=True,
+        )
 
         output = {
             "energy": total_energy,
+            "node_energy": node_energy,
             "contributions": contributions,
-            "forces": compute_forces(
-                energy=total_energy, positions=data.positions, training=training
-            ),
+            "forces": forces,
+            "virials": virials,
+            "stress": stress,
+            "displacement": data["shifts"],
+            "dipole": total_dipole,
+            "atomic_dipoles": atomic_dipoles,
         }
-
         return output
 
 
@@ -1409,14 +1494,7 @@ class EnergyDipolesMACE(torch.nn.Module):
                 sc=sc,
                 node_attrs=data["node_attrs"],
             )
-            node_out = readout(node_feats).squeeze(-1)  # [n_nodes, ]
-            # node_energies = readout(node_feats).squeeze(-1)  # [n_nodes, ]
-            node_energies = node_out[:, 0]
-            energy = scatter_sum(
-                src=node_energies, index=data["batch"], dim=-1, dim_size=num_graphs
-            )  # [n_graphs,]
-            energies.append(energy)
-            node_dipoles = node_out[:, 1:]
+            node_dipoles = readout(node_feats).squeeze(-1)  # [n_nodes, ]
             dipoles.append(node_dipoles)
 
         # Compute the energies and dipoles

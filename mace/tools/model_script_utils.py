@@ -110,6 +110,7 @@ def configure_model(
             atomic_energies=atomic_energies,
             avg_num_neighbors=args.avg_num_neighbors,
             atomic_numbers=z_table.zs,
+            # use_layer_norm=args.interaction_use_layer_norm,
         )
         model_config_foundation = None
 
@@ -162,6 +163,7 @@ def _build_model(
             radial_MLP=ast.literal_eval(args.radial_MLP),
             radial_type=args.radial_type,
             heads=heads,
+            
         )
     if args.model == "ScaleShiftMACE":
         return modules.ScaleShiftMACE(
@@ -177,6 +179,7 @@ def _build_model(
             radial_MLP=ast.literal_eval(args.radial_MLP),
             radial_type=args.radial_type,
             heads=heads,
+            
         )
     if args.model == "ScaleShiftMACExTB":
         return modules.ScaleShiftMACExTB(
@@ -198,8 +201,10 @@ def _build_model(
             half_range_pt=args.half_range_pt,
             half_range_pt_globpar=args.half_range_pt_globpar,
             half_range_pt_pair=args.half_range_pt_pair,
+            
         )
     if args.model == "FoundationMACE":
+        model_config_foundation["use_layer_norm"] = args.interaction_use_layer_norm
         return modules.ScaleShiftMACE(**model_config_foundation)
     if args.model == "ScaleShiftBOTNet":
         return modules.ScaleShiftBOTNet(
@@ -209,6 +214,7 @@ def _build_model(
             MLP_irreps=o3.Irreps(args.MLP_irreps),
             atomic_inter_scale=args.std,
             atomic_inter_shift=args.mean,
+            
         )
     if args.model == "BOTNet":
         return modules.BOTNet(
@@ -216,6 +222,7 @@ def _build_model(
             gate=modules.gate_dict[args.gate],
             interaction_cls_first=modules.interaction_classes[args.interaction_first],
             MLP_irreps=o3.Irreps(args.MLP_irreps),
+            
         )
     if args.model == "AtomicDipolesMACE":
         assert args.loss == "dipole", "Use dipole loss with AtomicDipolesMACE model"
@@ -230,6 +237,7 @@ def _build_model(
                 "RealAgnosticInteractionBlock"
             ],
             MLP_irreps=o3.Irreps(args.MLP_irreps),
+            
         )
     if args.model == "EnergyDipolesMACE":
         assert (
@@ -246,5 +254,6 @@ def _build_model(
                 "RealAgnosticInteractionBlock"
             ],
             MLP_irreps=o3.Irreps(args.MLP_irreps),
+            
         )
     raise RuntimeError(f"Unknown model: '{args.model}'")
