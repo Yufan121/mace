@@ -588,7 +588,7 @@ class ScaleShiftMACExTB(MACE):
         self.pairnet = pairnet  
         
         # only one of the three can be True
-        assert sum([elemnet, globnet, pairnet]) == 1, "Only one of the three can be True"
+        assert sum([elemnet, globnet, pairnet]) == 1, f"Only one of the three can be True: {elemnet}, {globnet}, {pairnet}"
         
         
         # Set parallel units
@@ -684,7 +684,7 @@ class ScaleShiftMACExTB(MACE):
         # Setup and gradient requirements
         data["positions"].requires_grad_(True)
         data["node_attrs"].requires_grad_(True)
-        print(f'node_attrs.shape: {data["node_attrs"].shape}, node_attrs: {data["node_attrs"]}')
+        # print(f'node_attrs.shape: {data["node_attrs"].shape}, node_attrs: {data["node_attrs"]}')
         num_graphs = data["ptr"].numel() - 1
         num_atoms_arange = torch.arange(data["positions"].shape[0])
         node_heads = data.get("head", torch.zeros_like(data["batch"]))[data["batch"]]
@@ -761,12 +761,12 @@ class ScaleShiftMACExTB(MACE):
         #     node_feats_out.register_hook(lambda grad: self._print_grad_hook(grad, "node_feats_out"))
         # only use the last node features
         node_feats_out = node_feats_list[-1]
-        print(f'node_feats_out.shape: {node_feats_out.shape}')
+        # print(f'node_feats_out.shape: {node_feats_out.shape}')
         
         # concat with node_attrs # TODO
         node_feats_out = torch.cat([node_feats_out, data["node_attrs"]], dim=-1)
         
-        print(f'node_feats_out.shape after concat: {node_feats_out.shape}')
+        # print(f'node_feats_out.shape after concat: {node_feats_out.shape}')
         
         # Predict scale and shift
         scale = self.scale_predictor(node_feats_out)
