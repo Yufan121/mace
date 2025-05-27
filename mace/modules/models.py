@@ -545,6 +545,24 @@ class PlusMinusSqrtIdentity(nn.Module):
         return output
 
 
+# range constraint parameters
+ele_param_enum = ['lev0', 'lev1', 'lev2', 'exp0', 'exp1', 'exp2', 'EN', 'GAM', 'GAM3', 'KCNS', 'KCNP', 'KCND', 'DPOL', 'QPOL', 'REPA', 'REPB', 'POLYS', 'POLYP', 'POLYD', 'LPARP', 'LPARD', 'mpvcn', 'mprad']
+
+elem_param_included = ['REPB', 'GAM', 'GAM3', 'DPOL', 'QPOL', 'POLYS', 'POLYP']# , 'KCNS', 'KCNP']
+
+elem_param_delta = {        #REPB,      GAM,      GAM3,     DPOL,       QPOL,       POLYS,      POLYP,    KCNS,    KCNP
+                    'H':    [0.276347,	0.101443, 0.2,	    1.390972,	0.006858,	0.238405,	0.6], # last is unsure
+                    'C':    [1.057769,	0.134504, 0.375,	0.102919,	0.053396,	0.57358, 	0.067776],
+                    # 'N':    [1.310648,     0,      0,      0,      0,      0,      0,     0], 
+                    'O':    [1.446104,	0.112974, 0.129283,	1.233918,	0.077707,	3.738823,	0.837705],
+                    # 'F':    [1.755371,     0,      0,      0,      0,      0,      0,     0], 
+                    # 'P':    [4.920876,     0,      0,      0,      0,      0,      0,     0], 
+                    # 'S':    [3.748773,     0,      0,      0,      0,      0,      0,     0], 
+                    # 'Cl':   [4.338283,   10,  10,  10,  10,  10,  10,  10,  10], 
+                    # 'Br':   [8.211340,     0,      0,      0,      0,      0,      0,     0], 
+                    # 'I':    [15.829794,     0,      0,      0,      0,      0,      0,     0], 
+                    } 
+
 @compile_mode("script")
 class ScaleShiftMACExTB(MACE):
     def __init__(
@@ -561,6 +579,7 @@ class ScaleShiftMACExTB(MACE):
         parallel_units_globpar: int = 640,
         parallel_units_pair: int = 640,
         separate_output_heads: bool = True,
+        use_custom_ranges: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -573,6 +592,7 @@ class ScaleShiftMACExTB(MACE):
         self.outdim = outdim
         self.outdim_globpar = outdim_globpar
         self.outdim_pair = outdim_pair
+        
         
         elemnet = False
         globnet = False
@@ -587,15 +607,24 @@ class ScaleShiftMACExTB(MACE):
         self.globnet = globnet
         self.pairnet = pairnet  
         
+        # if outdim != ele_param_enum
+        if use_custom_ranges and self.elemnet and self.outdim != len(ele_param_enum):
+            raise ValueError(f"outdim {outdim} must be equal to the number of elements in ele_param_enum: {len(ele_param_enum)}")
+
+        
         # only one of the three can be True
         assert sum([elemnet, globnet, pairnet]) == 1, f"Only one of the three can be True: {elemnet}, {globnet}, {pairnet}"
-        
         
         # Set parallel units
         self.parallel_units_elempar = parallel_units_elempar
         self.parallel_units_globpar = parallel_units_globpar
         self.parallel_units_pair = parallel_units_pair
         self.separate_output_heads = separate_output_heads
+        self.use_custom_ranges = use_custom_ranges
+        
+        # Check if custom ranges can be used
+        if self.use_custom_ranges and not self.separate_output_heads:
+            raise ValueError("Elem & parameter custom ranges can only be used with separate_output_heads=True")
         
         # Initialize half range parameters
         self.half_range_pt = torch.Tensor(half_range_pt or [0.05] * self.outdim)
@@ -603,12 +632,12 @@ class ScaleShiftMACExTB(MACE):
         self.half_range_pt_pair = torch.Tensor(half_range_pt_pair or [0.05] * self.outdim_pair)
 
         # Define connecting layer size
-        cnt_size = 128 + 100        # TODO
+        cnt_size = 64 + 100        # TODO
         
         # Create output heads
         if self.separate_output_heads:
             self.output_heads = self._create_output_heads(self.outdim, self.parallel_units_elempar, cnt_size)
-            self.output_globpar_heads = self._create_output_heads(self.outdim_globpar, self.parallel_units_globpar, cnt_size) # Can switch to ResidualBlockBS1
+            self.output_globpar_heads = self._create_output_heads(self.outdim_globpar, self.parallel_units_globpar, cnt_size)
             self.output_pair_heads = self._create_output_heads(self.outdim_pair, self.parallel_units_pair, cnt_size)
         else:
             self.output_head = self._create_combined_head(self.outdim, self.parallel_units_elempar, cnt_size)
@@ -617,7 +646,7 @@ class ScaleShiftMACExTB(MACE):
             
         # Define output activation
         self.out = nn.Identity()
-
+        
         # Create scale and shift predictors
         self.scale_predictor = self._create_predictor(cnt_size, self.outdim)
         self.shift_predictor = self._create_predictor(cnt_size, self.outdim, use_softplus=False)
@@ -631,7 +660,8 @@ class ScaleShiftMACExTB(MACE):
                 block_type(cnt_size, parallel_units),
                 block_type(parallel_units, parallel_units),
                 block_type(parallel_units, parallel_units),
-                nn.Linear(parallel_units, 1)
+                nn.Linear(parallel_units, 1),
+                # nn.Tanh() if self.use_custom_ranges else nn.Identity()
             ) for _ in range(outdim)
         ])
 
@@ -646,7 +676,7 @@ class ScaleShiftMACExTB(MACE):
 
     def _create_predictor(self, cnt_size, outdim, use_softplus=True):
         # Helper function to create a predictor
-        layers = [
+        layers = [ 
             nn.Linear(cnt_size, 64),
             nn.Linear(64, 128),
             nn.Linear(128, 128),
@@ -660,7 +690,7 @@ class ScaleShiftMACExTB(MACE):
         # Helper function for gradient hooks
         if grad is not None:
             print(f"--- Gradient Stats for {name} ---")
-            print(f"  - Norm: {grad.norm().item():.4f}")
+            print(f"  - Norm: {grad.norm().item():.4f}") 
             print(f"  - Mean: {grad.mean().item():.4f}")
             print(f"  - Max Abs: {grad.abs().max().item():.4f}")
             print(f"  - Has NaN: {torch.isnan(grad).any().item()}")
@@ -678,7 +708,7 @@ class ScaleShiftMACExTB(MACE):
         compute_displacement: bool = False,
         compute_hessian: bool = False,
         output_indices = None,
-        save_intermediate: bool = False,    # TODO
+        save_intermediate: bool = False,
         save_dir: str = "./tsne_features",
     ) -> Dict[str, Optional[torch.Tensor]]:
         # Setup and gradient requirements
@@ -788,8 +818,48 @@ class ScaleShiftMACExTB(MACE):
 
         params_pred = params_pred_raw
         if params_pred_raw is not None:
-            half_range_pt_device = self.half_range_pt.to(params_pred_raw.device)
-            params_pred = self.out(params_pred) * half_range_pt_device
+            if self.use_custom_ranges:
+                # Get atomic numbers for each node
+                atomic_numbers = self.atomic_numbers[data["node_attrs"].argmax(dim=1)]
+                
+                # Create a tensor of deltas for each node
+                deltas = torch.zeros_like(params_pred_raw)
+                for i, atom in enumerate(atomic_numbers):
+                    atom_num = atom.item()
+                    atom_symbol = {1: 'H', 6: 'C', 7: 'N', 8: 'O', 9: 'F', 15: 'P', 16: 'S', 17: 'Cl', 35: 'Br', 53: 'I'}.get(atom_num)
+                    if atom_symbol in elem_param_delta:
+                        # Get the delta values for this atom
+                        atom_deltas = torch.tensor(elem_param_delta[atom_symbol], device=params_pred_raw.device)
+                        # Map each parameter to its correct index in ele_param_enum
+                        for j, param in enumerate(elem_param_included):
+                            if param in ele_param_enum:
+                                param_idx = ele_param_enum.index(param)
+                                if param_idx < params_pred_raw.shape[1]:
+                                    deltas[i, param_idx] = atom_deltas[j]
+                    else:  # handle unknown atoms
+                        raise ValueError(f'TODO: atom_symbol: {atom_symbol} not in elem_param_delta')
+                
+                print(f'deltas: {deltas}')
+                
+                # Apply deltas to included parameters, use half_range_pt for others
+                half_range_pt_device = self.half_range_pt.to(params_pred_raw.device)
+                # Create a mask for included parameters
+                included_mask = torch.zeros_like(params_pred_raw, dtype=torch.bool)
+                for param in elem_param_included:
+                    if param in ele_param_enum:
+                        param_idx = ele_param_enum.index(param)
+                        if param_idx < params_pred_raw.shape[1]:
+                            included_mask[:, param_idx] = True
+                
+                # Apply deltas to included parameters, half_range_pt to others
+                params_pred = torch.where(
+                    included_mask,
+                    nn.functional.tanh(params_pred_raw * 0.1) * deltas, # tanh for range constraint, stretch to tune
+                    params_pred_raw * half_range_pt_device
+                )
+            else:
+                half_range_pt_device = self.half_range_pt.to(params_pred_raw.device)
+                params_pred = self.out(params_pred) * half_range_pt_device
 
         if output_indices is not None and params_pred is not None:
             params_pred = params_pred[output_indices]
@@ -966,14 +1036,8 @@ class BOTNet(torch.nn.Module):
                 sc=sc,
                 node_attrs=data["node_attrs"],
             )
-            node_out = readout(node_feats).squeeze(-1)  # [n_nodes, ]
-            # node_energies = readout(node_feats).squeeze(-1)  # [n_nodes, ]
-            node_energies = node_out[:, 0]
-            energy = scatter_sum(
-                src=node_energies, index=data["batch"], dim=-1, dim_size=data.num_graphs
-            )  # [n_graphs,]
-            energies.append(energy)
-            node_dipoles = node_out[:, 1:]
+            node_feats_list.append(node_feats)
+            node_dipoles = readout(node_feats).squeeze(-1)  # [n_nodes,3]
             dipoles.append(node_dipoles)
 
         # Compute the energies and dipoles
@@ -1046,7 +1110,7 @@ class ScaleShiftBOTNet(BOTNet):
         ]
         e0 = scatter_sum(
             src=node_e0, index=data.batch, dim=-1, dim_size=data.num_graphs
-        )  # [n_graphs,]
+        )  # [n_graphs, n_heads]
 
         # Embeddings
         node_feats = self.node_embedding(data.node_attrs)
@@ -1543,3 +1607,4 @@ class EnergyDipolesMACE(torch.nn.Module):
             "atomic_dipoles": atomic_dipoles,
         }
         return output
+
