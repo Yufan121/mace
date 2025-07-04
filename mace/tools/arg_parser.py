@@ -106,6 +106,7 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
             "MACE",
             "ScaleShiftMACE",
             "ScaleShiftMACExTB",
+            "EquivariantScaleShiftMACExTB",
             "ScaleShiftBOTNet",
             "AtomicDipolesMACE",
             "EnergyDipolesMACE",

@@ -203,6 +203,32 @@ def _build_model(
             half_range_pt_pair=args.half_range_pt_pair,
             
         )
+    if args.model == "EquivariantScaleShiftMACExTB":
+        return modules.EquivariantScaleShiftMACExTB(
+            **model_config,
+            pair_repulsion=args.pair_repulsion,
+            distance_transform=args.distance_transform,
+            correlation=args.correlation,
+            gate=modules.gate_dict[args.gate],
+            interaction_cls_first=modules.interaction_classes[args.interaction_first],
+            MLP_irreps=o3.Irreps(args.MLP_irreps),
+            atomic_inter_scale=args.std,
+            atomic_inter_shift=args.mean,
+            radial_MLP=ast.literal_eval(args.radial_MLP),
+            radial_type=args.radial_type,
+            heads=heads,
+            outdim=args.outdim,
+            outdim_globpar=args.outdim_globpar,
+            outdim_pair=args.outdim_pair,
+            half_range_pt=args.half_range_pt,
+            half_range_pt_globpar=args.half_range_pt_globpar,
+            half_range_pt_pair=args.half_range_pt_pair,
+            parallel_units_elempar=getattr(args, 'parallel_units_elempar', 640),
+            parallel_units_globpar=getattr(args, 'parallel_units_globpar', 640),
+            parallel_units_pair=getattr(args, 'parallel_units_pair', 640),
+            separate_output_heads=getattr(args, 'separate_output_heads', True),
+            use_custom_ranges=getattr(args, 'use_custom_ranges', False),
+        )
     if args.model == "FoundationMACE":
         model_config_foundation["use_layer_norm"] = args.interaction_use_layer_norm
         return modules.ScaleShiftMACE(**model_config_foundation)

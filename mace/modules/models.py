@@ -8,7 +8,7 @@ from typing import Any, Callable, Dict, List, Optional, Type, Union
 
 import numpy as np
 import torch
-from e3nn import o3
+from e3nn import o3, nn
 from e3nn.util.jit import compile_mode
 
 from mace.data import AtomicData
@@ -29,6 +29,7 @@ from .blocks import (
     RadialEmbeddingBlock,
     ScaleShiftBlock,
 )
+from .symmetric_contraction import SymmetricContraction
 from .utils import (
     compute_fixed_charge_dipole,
     compute_forces,
@@ -417,9 +418,8 @@ class ScaleShiftMACE(MACE):
                 node_feats=node_feats, sc=sc, node_attrs=data["node_attrs"]
             )
             node_feats_list.append(node_feats)
-            node_es_list.append(
-                readout(node_feats, node_heads)[num_atoms_arange, node_heads]
-            )  # {[n_nodes, ], }
+            node_es_list.append(readout(node_feats, node_heads)[num_atoms_arange, node_heads])
+
             if save_intermediate:
                 # Save each layer's node features as a numpy file
                 np.save(f"{save_dir}/layer_{i}_node_feats.npy", node_feats.detach().cpu().numpy())
@@ -467,21 +467,20 @@ class ScaleShiftMACE(MACE):
 
 
 
-import torch.nn as nn
 import torch.nn.functional as F
-class ResidualBlock(nn.Module):
+class ResidualBlock(torch.nn.Module):
     def __init__(self, input_dim, output_dim):
         super(ResidualBlock, self).__init__()
-        self.fc = nn.Linear(input_dim, output_dim)
-        self.ln = nn.LayerNorm(output_dim)
-        # self.activation = nn.Tanh()  # You can replace this with F.relu or other activation functions
+        self.fc = torch.nn.Linear(input_dim, output_dim)
+        self.ln = torch.nn.LayerNorm(output_dim)
+        # self.activation = torch.nn.Tanh()  # You can replace this with F.relu or other activation functions
         # self.activation = F.relu  # LeakyReLU  
-        # self.activation = nn.LeakyReLU(negative_slope=0.01)        
-        self.activation = nn.SiLU()
+        # self.activation = torch.nn.LeakyReLU(negative_slope=0.01)        
+        self.activation = torch.nn.SiLU()
         
         # Add a linear layer to match dimensions if needed
         if input_dim != output_dim:
-            self.match_dim = nn.Linear(input_dim, output_dim)
+            self.match_dim = torch.nn.Linear(input_dim, output_dim)
         else:
             self.match_dim = None
 
@@ -530,7 +529,7 @@ class ResidualBlock(nn.Module):
         
 #         return out
 
-class PlusMinusSqrtIdentity(nn.Module):
+class PlusMinusSqrtIdentity(torch.nn.Module):
     def forward(self, x):
         # Apply identity function for the range -1 to 1
         identity_mask = (x >= -1) & (x <= 1)
@@ -627,12 +626,13 @@ class ScaleShiftMACExTB(MACE):
             raise ValueError("Elem & parameter custom ranges can only be used with separate_output_heads=True")
         
         # Initialize half range parameters
-        self.half_range_pt = torch.Tensor(half_range_pt or [0.05] * self.outdim)
-        self.half_range_pt_globpar = torch.Tensor(half_range_pt_globpar or [0.05] * self.outdim_globpar)
-        self.half_range_pt_pair = torch.Tensor(half_range_pt_pair or [0.05] * self.outdim_pair)
+        self.half_range_pt = torch.tensor(half_range_pt or [0.05] * self.outdim, dtype=torch.get_default_dtype())
+        self.half_range_pt_globpar = torch.tensor(half_range_pt_globpar or [0.05] * self.outdim_globpar, dtype=torch.get_default_dtype())
+        self.half_range_pt_pair = torch.tensor(half_range_pt_pair or [0.05] * self.outdim_pair, dtype=torch.get_default_dtype())
 
         # Define connecting layer size
         cnt_size = 64 + 100        # TODO
+        # cnt_size = 128 + 2
         
         # Create output heads
         if self.separate_output_heads:
@@ -645,7 +645,7 @@ class ScaleShiftMACExTB(MACE):
             self.output_pair_head = self._create_combined_head(self.outdim_pair, self.parallel_units_pair, cnt_size)
             
         # Define output activation
-        self.out = nn.Identity()
+        self.out = torch.nn.Identity()
         
         # Create scale and shift predictors
         self.scale_predictor = self._create_predictor(cnt_size, self.outdim)
@@ -655,48 +655,40 @@ class ScaleShiftMACExTB(MACE):
 
     def _create_output_heads(self, outdim, parallel_units, cnt_size, block_type=ResidualBlock):
         # Helper function to create separate output heads
-        return nn.ModuleList([
-            nn.Sequential(
+        return torch.nn.ModuleList([
+            torch.nn.Sequential(
                 block_type(cnt_size, parallel_units),
                 block_type(parallel_units, parallel_units),
                 block_type(parallel_units, parallel_units),
-                nn.Linear(parallel_units, 1),
-                # nn.Tanh() if self.use_custom_ranges else nn.Identity()
+                torch.nn.Linear(parallel_units, 1),
+                # torch.nn.Tanh() if self.use_custom_ranges else torch.nn.Identity()
             ) for _ in range(outdim)
         ])
 
     def _create_combined_head(self, outdim, parallel_units, cnt_size):
         # Helper function to create a combined output head
-        return nn.Sequential(
+        return torch.nn.Sequential(
             ResidualBlock(cnt_size, parallel_units),
             ResidualBlock(parallel_units, parallel_units),
             ResidualBlock(parallel_units, parallel_units),
-            nn.Linear(parallel_units, outdim)
+            torch.nn.Linear(parallel_units, outdim)
         )
 
     def _create_predictor(self, cnt_size, outdim, use_softplus=True):
         # Helper function to create a predictor
         layers = [ 
-            nn.Linear(cnt_size, 64),
-            nn.Linear(64, 128),
-            nn.Linear(128, 128),
-            nn.Linear(128, outdim)
+            torch.nn.Linear(cnt_size, 64),
+            torch.nn.Linear(64, 128),
+            torch.nn.Linear(128, 128),
+            torch.nn.Linear(128, outdim)
         ]
         if use_softplus:
-            layers.append(nn.Softplus())
-        return nn.Sequential(*layers)
+            layers.append(torch.nn.Softplus())
+        return torch.nn.Sequential(*layers)
 
     def _print_grad_hook(self, grad: torch.Tensor, name: str):
         # Helper function for gradient hooks
-        if grad is not None:
-            print(f"--- Gradient Stats for {name} ---")
-            print(f"  - Norm: {grad.norm().item():.4f}") 
-            print(f"  - Mean: {grad.mean().item():.4f}")
-            print(f"  - Max Abs: {grad.abs().max().item():.4f}")
-            print(f"  - Has NaN: {torch.isnan(grad).any().item()}")
-            print(f"  - Has Inf: {torch.isinf(grad).any().item()}")
-        else:
-            print(f"--- No gradient computed for {name} ---")
+        print(f"--- Gradient Stats for {name} ---" + (f"\n  - Norm: {grad.norm().item():.4e}\n  - Mean: {grad.mean().item():.4e}\n  - Max Abs: {grad.abs().max().item():.4e}\n  - Has NaN: {torch.isnan(grad).any().item()}\n  - Has Inf: {torch.isinf(grad).any().item()}" if grad is not None else "\n--- No gradient computed for {name} ---"))
 
     def forward(
         self,
@@ -854,12 +846,11 @@ class ScaleShiftMACExTB(MACE):
                 # Apply deltas to included parameters, half_range_pt to others
                 params_pred = torch.where(
                     included_mask,
-                    nn.functional.tanh(params_pred_raw * 0.1) * deltas, # tanh for range constraint, stretch to tune
+                    torch.nn.functional.tanh(params_pred_raw * 0.1) * deltas, # tanh for range constraint, stretch to tune
                     params_pred_raw * half_range_pt_device
                 )
             else:
-                half_range_pt_device = self.half_range_pt.to(params_pred_raw.device)
-                params_pred = self.out(params_pred) * half_range_pt_device
+                params_pred = self.out(params_pred) * self.half_range_pt.to(params_pred.device)
 
         if output_indices is not None and params_pred is not None:
             params_pred = params_pred[output_indices]
@@ -881,8 +872,7 @@ class ScaleShiftMACExTB(MACE):
 
         outputs_globpar = outputs_globpar_raw
         if outputs_globpar_raw is not None:
-            half_range_pt_globpar_device = self.half_range_pt_globpar.to(outputs_globpar_raw.device)
-            outputs_globpar = self.out(outputs_globpar) * half_range_pt_globpar_device
+            outputs_globpar = self.out(outputs_globpar) * self.half_range_pt_globpar.to(outputs_globpar.device)
 
         #### Compute pair parameters #### 
         pair_params = []
@@ -899,10 +889,9 @@ class ScaleShiftMACExTB(MACE):
                     graph_pair_params = [head(pairwise_feats) for head in self.output_pair_heads]
                     graph_pair_params = torch.cat(graph_pair_params, dim=1)
                 else:
-                    graph_pair_params = self.output_pair_head(pairwise_feats)
+                    graph_pair_params = self.output_pair_head(pairwise_feats) if self.output_pair_head is not None else torch.zeros(num_atoms * num_atoms, self.outdim_pair, device=pairwise_feats.device)
 
-                half_range_pt_pair_device = self.half_range_pt_pair.to(graph_pair_params.device)
-                graph_pair_params = self.out(graph_pair_params) * half_range_pt_pair_device
+                graph_pair_params = self.out(graph_pair_params) * self.half_range_pt_pair.to(graph_pair_params.device)
                 
                 pair_params.append(graph_pair_params)
             
@@ -1543,8 +1532,8 @@ class EnergyDipolesMACE(torch.nn.Module):
         energies = [e0]
         node_energies_list = [node_e0]
         dipoles = []
-        for interaction, product, readout in zip(
-            self.interactions, self.products, self.readouts
+        for interaction, readout in zip(
+            self.interactions, self.readouts
         ):
             node_feats, sc = interaction(
                 node_attrs=data["node_attrs"],
@@ -1606,5 +1595,555 @@ class EnergyDipolesMACE(torch.nn.Module):
             "dipole": total_dipole,
             "atomic_dipoles": atomic_dipoles,
         }
+        return output
+
+
+# Equivariant version of ResidualBlock
+@compile_mode("script")
+class EquivariantResidualBlock(torch.nn.Module):
+    def __init__(self, irreps_in: o3.Irreps, irreps_out: o3.Irreps, gate: Optional[Callable] = None):
+        super(EquivariantResidualBlock, self).__init__()
+        
+        # Use e3nn Linear instead of nn.Linear
+        self.linear = o3.Linear(irreps_in, irreps_out, internal_weights=True, shared_weights=True)
+        
+        # Use e3nn normalization instead of LayerNorm
+        # self.norm = None  # Remove normalization for simplicity, or use e3nn.nn.BatchNorm
+        
+        # Use e3nn activation for scalars only
+        if gate is None:
+            gate = torch.nn.functional.silu
+            
+        # Create activation for scalars only
+        irreps_scalars = o3.Irreps([(mul, ir) for mul, ir in irreps_out if ir.l == 0])
+        if len(irreps_scalars) > 0:
+            self.activation = nn.Activation(irreps_in=irreps_scalars, acts=[gate])
+        else:
+            self.activation = None
+        
+        # Residual connection - handle dimension mismatch
+        if irreps_in != irreps_out:
+            self.match_dim = o3.Linear(irreps_in, irreps_out, internal_weights=True, shared_weights=True)
+        else:
+            self.match_dim = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        
+        # Linear transformation
+        out = self.linear(x)
+        
+        # Apply activation only to scalar features
+        if self.activation is not None:
+            # Extract scalar features
+            irreps_scalars = self.activation.irreps_in
+            scalar_dim = irreps_scalars.dim
+            
+            if scalar_dim > 0:
+                scalars = out[..., :scalar_dim]
+                vectors = out[..., scalar_dim:]
+                
+                # Apply activation to scalars
+                scalars = self.activation(scalars)
+                
+                # Concatenate back
+                out = torch.cat([scalars, vectors], dim=-1)
+        
+        # Handle residual connection
+        if self.match_dim is not None:
+            residual = self.match_dim(residual)
+        
+        # Add residual
+        out = out + residual
+        
+        return out
+
+
+@compile_mode("script")
+class EquivariantScaleShiftMACExTB(MACE):
+    # 类级别的类型注解来消除 TorchScript 警告
+    output_heads: Optional[torch.nn.ModuleList]
+    output_globpar_heads: Optional[torch.nn.ModuleList]
+    output_pair_heads: Optional[torch.nn.ModuleList]
+    output_head: Optional[torch.nn.Module]
+    output_globpar_head: Optional[torch.nn.Module]
+    output_pair_head: Optional[torch.nn.Module]
+    scale_predictor: Optional[torch.nn.Module]
+    shift_predictor: Optional[torch.nn.Module]
+    scale_predictor_globpar: Optional[torch.nn.Module]
+    shift_predictor_globpar: Optional[torch.nn.Module]
+    global_projection: Optional[torch.nn.Module]
+    scalar_projection: Optional[torch.nn.Module]
+    final_node_irreps: Optional[o3.Irreps]
+    final_global_irreps: Optional[o3.Irreps]
+    
+    def __init__(
+        self,
+        atomic_inter_scale: float,
+        atomic_inter_shift: float,
+        outdim: int,
+        outdim_globpar: int,
+        outdim_pair: int,
+        half_range_pt = None,
+        half_range_pt_globpar = None,
+        half_range_pt_pair = None,
+        parallel_units_elempar: int = 640,
+        parallel_units_globpar: int = 640,
+        parallel_units_pair: int = 640,
+        separate_output_heads: bool = True,
+        use_custom_ranges: bool = False,
+        equivariant_feat_len: int = 64,  # Add predefined feature length
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        
+        # Initialize scale and shift block
+        self.scale_shift = ScaleShiftBlock(
+            scale=atomic_inter_scale, shift=atomic_inter_shift
+        )
+        
+        # Set output dimensions
+        self.outdim = outdim
+        self.outdim_globpar = outdim_globpar
+        self.outdim_pair = outdim_pair
+        
+        # Network flags
+        elemnet = self.outdim > 0
+        globnet = self.outdim_globpar > 0
+        pairnet = self.outdim_pair > 0
+        
+        self.elemnet = elemnet
+        self.globnet = globnet
+        self.pairnet = pairnet
+        
+        # Only one of the three can be True
+        assert sum([elemnet, globnet, pairnet]) == 1, f"Only one of the three can be True: {elemnet}, {globnet}, {pairnet}"
+        
+        # Set parallel units and other parameters
+        self.parallel_units_elempar = parallel_units_elempar
+        self.parallel_units_globpar = parallel_units_globpar
+        self.parallel_units_pair = parallel_units_pair
+        self.separate_output_heads = separate_output_heads
+        self.use_custom_ranges = use_custom_ranges
+        
+        # Check custom ranges compatibility
+        if self.use_custom_ranges and not self.separate_output_heads:
+            raise ValueError("Elem & parameter custom ranges can only be used with separate_output_heads=True")
+        
+        # Initialize half range parameters and register as buffers for proper device handling
+        self.register_buffer(
+            "half_range_pt",
+            torch.tensor(half_range_pt or [0.05] * self.outdim, dtype=torch.get_default_dtype())
+        )
+        self.register_buffer(
+            "half_range_pt_globpar", 
+            torch.tensor(half_range_pt_globpar or [0.05] * self.outdim_globpar, dtype=torch.get_default_dtype())
+        )
+        self.register_buffer(
+            "half_range_pt_pair",
+            torch.tensor(half_range_pt_pair or [0.05] * self.outdim_pair, dtype=torch.get_default_dtype())
+        )
+
+        # Store the predefined feature length
+        self.equivariant_feat_len = equivariant_feat_len
+        
+        # Set final irreps based on predefined feature length
+        self.final_node_irreps = o3.Irreps(f"{equivariant_feat_len}x0e")  # Use predefined scalar features
+        self.final_global_irreps = o3.Irreps("64x0e")  # Global scalar features
+        
+        # Create scalar projection layer (from MACE features to our scalar features)
+        # We'll assume MACE outputs have some scalar features, we'll project them
+        self.scalar_projection = None  # Will be set if needed during forward
+        
+        # For global features, create projection layer
+        if self.globnet:
+            self.global_projection = o3.Linear(
+                self.final_node_irreps,  # Input from node features
+                self.final_global_irreps, 
+                internal_weights=True, 
+                shared_weights=True
+            )
+        else:
+            self.global_projection = None
+            
+        # Create equivariant output heads immediately
+        self._create_all_networks()
+        
+        # Define output activation
+        self.out = torch.nn.Identity()
+
+    def _create_all_networks(self):
+        """Create all networks during initialization"""
+        # Initialize all attributes to None first
+        self.output_heads = None
+        self.output_globpar_heads = None
+        self.output_pair_heads = None
+        self.output_head = None
+        self.output_globpar_head = None
+        self.output_pair_head = None
+        
+        # Create equivariant output heads
+        if self.separate_output_heads:
+            if self.outdim > 0:
+                self.output_heads = self._create_equivariant_output_heads(
+                    self.outdim, self.parallel_units_elempar, self.final_node_irreps
+                )
+                
+            if self.globnet:
+                self.output_globpar_heads = self._create_equivariant_output_heads(
+                    self.outdim_globpar, self.parallel_units_globpar, self.final_global_irreps
+                )
+                
+            if self.pairnet:
+                self.output_pair_heads = self._create_equivariant_output_heads(
+                    self.outdim_pair, self.parallel_units_pair, self.final_node_irreps
+                )
+        else:
+            if self.outdim > 0:
+                self.output_head = self._create_equivariant_combined_head(
+                    self.outdim, self.parallel_units_elempar, self.final_node_irreps
+                )
+                
+            if self.globnet:
+                self.output_globpar_head = self._create_equivariant_combined_head(
+                    self.outdim_globpar, self.parallel_units_globpar, self.final_global_irreps
+                )
+                
+            if self.pairnet:
+                self.output_pair_head = self._create_equivariant_combined_head(
+                    self.outdim_pair, self.parallel_units_pair, self.final_node_irreps
+                )
+        
+        # Create equivariant scale and shift predictors
+        if self.outdim > 0:
+            self.scale_predictor = self._create_equivariant_predictor(self.final_node_irreps, self.outdim)
+            self.shift_predictor = self._create_equivariant_predictor(self.final_node_irreps, self.outdim)
+        else:
+            self.scale_predictor = None
+            self.shift_predictor = None
+        
+        if self.globnet:
+            self.scale_predictor_globpar = self._create_equivariant_predictor(self.final_global_irreps, self.outdim_globpar)
+            self.shift_predictor_globpar = self._create_equivariant_predictor(self.final_global_irreps, self.outdim_globpar)
+        else:
+            self.scale_predictor_globpar = None
+            self.shift_predictor_globpar = None
+
+    def _extract_and_project_scalars(self, node_feats):
+        """Extract scalar features from MACE output and project to predefined dimension"""
+        # MACE typically outputs features with both scalars and vectors
+        # We need to extract just the scalar part and project it to our target dimension
+        
+        # Try to get the irreps from the last readout layer
+        try:
+            # Get the irreps from the last interaction's target_irreps
+            last_interaction_irreps = self.interactions[-1].target_irreps
+            scalar_irreps = o3.Irreps([(mul, ir) for mul, ir in last_interaction_irreps if ir.l == 0])
+            
+            if scalar_irreps.dim > 0:
+                # Extract scalar features
+                scalar_features = node_feats[..., :scalar_irreps.dim]
+                
+                # If we need to project to a different dimension
+                if scalar_irreps.dim != self.equivariant_feat_len:
+                    if not hasattr(self, '_scalar_projection_layer') or self._scalar_projection_layer is None:
+                        # Create projection layer on first use
+                        self._scalar_projection_layer = torch.nn.Linear(
+                            scalar_irreps.dim, 
+                            self.equivariant_feat_len
+                        ).to(node_feats.device)
+                    scalar_features = self._scalar_projection_layer(scalar_features)
+            else:
+                # No scalar features, create them from a simple projection
+                if not hasattr(self, '_scalar_creation_layer') or self._scalar_creation_layer is None:
+                    self._scalar_creation_layer = torch.nn.Linear(
+                        node_feats.shape[-1], 
+                        self.equivariant_feat_len
+                    ).to(node_feats.device)
+                scalar_features = self._scalar_creation_layer(node_feats)
+                
+        except Exception:
+            # Fallback: simple linear projection from full features
+            if not hasattr(self, '_scalar_fallback_layer') or self._scalar_fallback_layer is None:
+                self._scalar_fallback_layer = torch.nn.Linear(
+                    node_feats.shape[-1], 
+                    self.equivariant_feat_len
+                ).to(node_feats.device)
+            scalar_features = self._scalar_fallback_layer(node_feats)
+            
+        return scalar_features
+
+    def _create_equivariant_output_heads(self, outdim, parallel_units, input_irreps):
+        """Create separate equivariant output heads"""
+        if outdim == 0:
+            return torch.nn.ModuleList()
+            
+        # Create intermediate irreps for hidden layers (mainly scalars)
+        hidden_irreps = o3.Irreps(f"{parallel_units}x0e")
+        output_irreps = o3.Irreps("1x0e")  # Single scalar output
+        
+        heads = []
+        for _ in range(outdim):
+            head = torch.nn.Sequential(
+                EquivariantResidualBlock(input_irreps, hidden_irreps),
+                EquivariantResidualBlock(hidden_irreps, hidden_irreps),
+                EquivariantResidualBlock(hidden_irreps, hidden_irreps),
+                o3.Linear(hidden_irreps, output_irreps, internal_weights=True, shared_weights=True)
+            )
+            heads.append(head)
+        
+        return torch.nn.ModuleList(heads)
+
+    def _create_equivariant_combined_head(self, outdim, parallel_units, input_irreps):
+        """Create a combined equivariant output head"""
+        if outdim == 0:
+            return None
+            
+        # Create intermediate irreps
+        hidden_irreps = o3.Irreps(f"{parallel_units}x0e")
+        output_irreps = o3.Irreps(f"{outdim}x0e")  # Multiple scalar outputs
+        
+        return torch.nn.Sequential(
+            EquivariantResidualBlock(input_irreps, hidden_irreps),
+            EquivariantResidualBlock(hidden_irreps, hidden_irreps),
+            EquivariantResidualBlock(hidden_irreps, hidden_irreps),
+            o3.Linear(hidden_irreps, output_irreps, internal_weights=True, shared_weights=True)
+        )
+
+    def _create_equivariant_predictor(self, input_irreps, outdim):
+        """Create an equivariant predictor"""
+        if outdim == 0:
+            return None
+            
+        # For scale/shift prediction, use smaller networks
+        hidden_irreps = o3.Irreps("128x0e")
+        output_irreps = o3.Irreps(f"{outdim}x0e")
+        
+        return torch.nn.Sequential(
+            o3.Linear(input_irreps, hidden_irreps, internal_weights=True, shared_weights=True),
+            nn.Activation(irreps_in=hidden_irreps, acts=[torch.nn.functional.silu]),
+            o3.Linear(hidden_irreps, hidden_irreps, internal_weights=True, shared_weights=True),
+            nn.Activation(irreps_in=hidden_irreps, acts=[torch.nn.functional.silu]),
+            o3.Linear(hidden_irreps, output_irreps, internal_weights=True, shared_weights=True),
+            nn.Activation(irreps_in=output_irreps, acts=[torch.nn.functional.softplus])  # For scale prediction
+        )
+
+    def _print_grad_hook(self, grad: torch.Tensor, name: str):
+        # Helper function for gradient hooks
+        print(f"--- Gradient Stats for {name} ---" + (f"\n  - Norm: {grad.norm().item():.4f}\n  - Mean: {grad.mean().item():.4f}\n  - Max Abs: {grad.abs().max().item():.4f}\n  - Has NaN: {torch.isnan(grad).any().item()}\n  - Has Inf: {torch.isinf(grad).any().item()}" if grad is not None else "\n--- No gradient computed for {name} ---"))
+
+    def forward(
+        self,
+        data: Dict[str, torch.Tensor],
+        training: bool = False,
+        compute_force: bool = True,
+        compute_virials: bool = False,
+        compute_stress: bool = False,
+        compute_displacement: bool = False,
+        compute_hessian: bool = False,
+        output_indices = None,
+        save_intermediate: bool = False,
+        save_dir: str = "./tsne_features",
+    ) -> Dict[str, Optional[torch.Tensor]]:
+        # Setup and gradient requirements
+        data["positions"].requires_grad_(True)
+        data["node_attrs"].requires_grad_(True)
+        
+        num_graphs = data["ptr"].numel() - 1
+        num_atoms_arange = torch.arange(data["positions"].shape[0])
+        node_heads = data.get("head", torch.zeros_like(data["batch"]))[data["batch"]]
+        displacement = torch.zeros(
+            (num_graphs, 3, 3),
+            dtype=data["positions"].dtype,
+            device=data["positions"].device,
+        )
+        
+        if compute_virials or compute_stress or compute_displacement:
+            data["positions"], data["shifts"], displacement = get_symmetric_displacement(
+                positions=data["positions"],
+                unit_shifts=data["unit_shifts"],
+                cell=data["cell"],
+                edge_index=data["edge_index"],
+                num_graphs=num_graphs,
+                batch=data["batch"],
+            )
+
+        # Compute atomic energies
+        node_e0 = self.atomic_energies_fn(data["node_attrs"])[num_atoms_arange, node_heads]
+        e0 = scatter_sum(src=node_e0, index=data["batch"], dim=0, dim_size=num_graphs)
+
+        # Compute embeddings and edge features
+        node_feats = self.node_embedding(data["node_attrs"])
+        vectors, lengths = get_edge_vectors_and_lengths(
+            positions=data["positions"],
+            edge_index=data["edge_index"],
+            shifts=data["shifts"],
+        )
+        edge_attrs = self.spherical_harmonics(vectors)
+        edge_feats = self.radial_embedding(lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers)
+        pair_node_energy = self.pair_repulsion_fn(lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers) if hasattr(self, "pair_repulsion") else torch.zeros_like(node_e0)
+
+        # Process interactions (this part remains equivariant)
+        node_es_list = [pair_node_energy]
+        node_feats_list = []
+        for i, (interaction, product, readout) in enumerate(zip(self.interactions, self.products, self.readouts)):
+            node_feats, sc = interaction(
+                node_attrs=data["node_attrs"],
+                node_feats=node_feats,
+                edge_attrs=edge_attrs,
+                edge_feats=edge_feats,
+                edge_index=data["edge_index"],
+            )
+            node_feats = product(node_feats=node_feats, sc=sc, node_attrs=data["node_attrs"])
+            node_feats_list.append(node_feats)
+            node_es_list.append(readout(node_feats, node_heads)[num_atoms_arange, node_heads])
+
+            if training:
+                node_feats_list[-1].register_hook(lambda grad: self._print_grad_hook(grad, f"equivariant_node_feats_list[-1]"))
+                node_es_list[-1].register_hook(lambda grad: self._print_grad_hook(grad, f"equivariant_node_es_list[-1]"))
+
+            if save_intermediate:
+                os.makedirs(save_dir, exist_ok=True)
+                if self.elemnet:
+                    np.save(f"{save_dir}/layer_{i}_equivariant_elemnet_node_feats.npy", node_feats.detach().cpu().numpy())
+                elif self.globnet:
+                    np.save(f"{save_dir}/layer_{i}_equivariant_globnet_node_feats.npy", node_feats.detach().cpu().numpy())
+                elif self.pairnet:
+                    np.save(f"{save_dir}/layer_{i}_equivariant_pairnet_node_feats.npy", node_feats.detach().cpu().numpy())
+
+        # Use the last node features (these should be equivariant)
+        node_feats_out = node_feats_list[-1]
+        
+        # Project to scalar features using predefined projection
+        # Extract scalar features from MACE output and project to our predefined dimension
+        scalar_features = self._extract_and_project_scalars(node_feats_out)
+        
+        if training and scalar_features.requires_grad:
+            scalar_features.register_hook(lambda grad: self._print_grad_hook(grad, "equivariant_scalar_features"))
+        
+        # Predict scale and shift (using scalar features only)
+        # scale = self.scale_predictor(scalar_features) if self.scale_predictor is not None else None
+        # shift = self.shift_predictor(scalar_features) if self.shift_predictor is not None else None
+
+        #### Compute element parameters #### 
+        if self.separate_output_heads and self.output_heads is not None:
+            outputs = [head(scalar_features) for head in self.output_heads]
+            params_pred_raw = torch.cat(outputs, dim=1) if outputs else None
+        else:
+            params_pred_raw = self.output_head(scalar_features) if self.output_head is not None else None
+
+        if training and params_pred_raw is not None and params_pred_raw.requires_grad:  # debug hook
+            params_pred_raw.register_hook(lambda grad: self._print_grad_hook(grad, "equivariant_params_pred_raw"))
+            
+        # save params_pred_raw
+        if save_intermediate and params_pred_raw is not None:
+            np.save(f"{save_dir}/equivariant_params_pred_raw.npy", params_pred_raw.detach().cpu().numpy())
+
+        # Apply range constraints (same as original)
+        params_pred = params_pred_raw
+        if params_pred_raw is not None:
+            if self.use_custom_ranges:
+                # Apply custom ranges (same logic as original)
+                atomic_numbers = self.atomic_numbers[data["node_attrs"].argmax(dim=1)]
+                deltas = torch.zeros_like(params_pred_raw)
+                for i, atom in enumerate(atomic_numbers):
+                    atom_num = atom.item()
+                    atom_symbol = {1: 'H', 6: 'C', 7: 'N', 8: 'O', 9: 'F', 15: 'P', 16: 'S', 17: 'Cl', 35: 'Br', 53: 'I'}.get(atom_num)
+                    if atom_symbol in elem_param_delta:
+                        atom_deltas = torch.tensor(elem_param_delta[atom_symbol], device=params_pred_raw.device)
+                        for j, param in enumerate(elem_param_included):
+                            if param in ele_param_enum:
+                                param_idx = ele_param_enum.index(param)
+                                if param_idx < params_pred_raw.shape[1]:
+                                    deltas[i, param_idx] = atom_deltas[j]
+                    else:
+                        raise ValueError(f'atom_symbol: {atom_symbol} not in elem_param_delta')
+                
+                included_mask = torch.zeros_like(params_pred_raw, dtype=torch.bool)
+                for param in elem_param_included:
+                    if param in ele_param_enum:
+                        param_idx = ele_param_enum.index(param)
+                        if param_idx < params_pred_raw.shape[1]:
+                            included_mask[:, param_idx] = True
+                
+                params_pred = torch.where(
+                    included_mask,
+                    torch.nn.functional.tanh(params_pred_raw * 0.1) * deltas,
+                    params_pred_raw * self.half_range_pt
+                )
+            else:
+                params_pred = self.out(params_pred) * self.half_range_pt
+
+        if output_indices is not None and params_pred is not None:
+            params_pred = params_pred[output_indices]
+
+        #### Compute global parameters using equivariant projection + pooling #### 
+        outputs_globpar = None
+        if self.globnet:
+            # Use equivariant projection on scalar features, then scatter_mean for pooling
+            # This maintains equivariance because scalars are rotation invariant
+            
+            # Project scalar features to global scalar features
+            if self.global_projection is not None:
+                node_global_feats = self.global_projection(scalar_features)
+            else:
+                node_global_feats = scalar_features
+            
+            # Pool over nodes in each graph to get graph-level features
+            global_feats = scatter_mean(src=node_global_feats, index=data["batch"], dim=0, dim_size=num_graphs)
+
+            # scale_globpar = self.scale_predictor_globpar(global_feats) if self.scale_predictor_globpar is not None else None
+            # shift_globpar = self.shift_predictor_globpar(global_feats) if self.shift_predictor_globpar is not None else None
+
+            if self.separate_output_heads and self.output_globpar_heads is not None:
+                outputs_globpar_list = [head(global_feats) for head in self.output_globpar_heads]
+                outputs_globpar_raw = torch.cat(outputs_globpar_list, dim=1) if outputs_globpar_list else None
+            else:
+                outputs_globpar_raw = self.output_globpar_head(global_feats) if self.output_globpar_head is not None else None
+
+            if training and outputs_globpar_raw is not None and outputs_globpar_raw.requires_grad: # debug hook
+                outputs_globpar_raw.register_hook(lambda grad: self._print_grad_hook(grad, "equivariant_outputs_globpar_raw"))
+
+            if outputs_globpar_raw is not None:
+                outputs_globpar = self.out(outputs_globpar_raw) * self.half_range_pt_globpar
+
+        #### Compute pair parameters (if needed) #### 
+        pair_params = []
+        if self.outdim_pair > 0:
+            for graph_idx in range(num_graphs):
+                start_idx = data['ptr'][graph_idx].item()
+                end_idx = data['ptr'][graph_idx + 1].item()
+                num_atoms = end_idx - start_idx
+                graph_scalar_feats = scalar_features[start_idx:end_idx]
+                
+                # Create pairwise features using scalar operations (maintains equivariance)
+                pairwise_feats = graph_scalar_feats.unsqueeze(0).expand(num_atoms, -1, -1) + graph_scalar_feats.unsqueeze(1).expand(-1, num_atoms, -1)
+                pairwise_feats = pairwise_feats.reshape(num_atoms * num_atoms, -1)
+
+                if self.separate_output_heads and self.output_pair_heads is not None:
+                    graph_pair_params = [head(pairwise_feats) for head in self.output_pair_heads]
+                    graph_pair_params = torch.cat(graph_pair_params, dim=1)
+                else:
+                    graph_pair_params = self.output_pair_head(pairwise_feats) if self.output_pair_head is not None else torch.zeros(num_atoms * num_atoms, self.outdim_pair, device=pairwise_feats.device)
+
+                graph_pair_params = self.out(graph_pair_params) * self.half_range_pt_pair
+                
+                pair_params.append(graph_pair_params)
+            
+            if pair_params:
+                pair_params = torch.stack(pair_params, dim=0)
+                if pair_params.ndim == 2:
+                    pair_params = pair_params.unsqueeze(1)
+            else:
+                pair_params = None
+
+        # Prepare output dictionary
+        output = {
+            "params_pred": params_pred,
+            "globpars_pred": outputs_globpar,
+            "node_feats": scalar_features,  # Return scalar features
+            "pair_param": pair_params,
+        }
+
         return output
 
