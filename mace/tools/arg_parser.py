@@ -134,6 +134,14 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
     )
     
     parser.add_argument(
+        "--scatter_method",
+        help="Method for global feature aggregation",
+        type=str,
+        default="scatter_mean",
+        choices=["scatter_mean", "scatter_sum"],
+    )
+    
+    parser.add_argument(
         "--r_max", help="distance cutoff (in Ang)", type=float, default=5.0
     )
     parser.add_argument(

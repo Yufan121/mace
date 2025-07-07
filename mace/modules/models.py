@@ -579,6 +579,7 @@ class ScaleShiftMACExTB(MACE):
         parallel_units_pair: int = 640,
         separate_output_heads: bool = True,
         use_custom_ranges: bool = False,
+        scatter_method: str = "scatter_mean",
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -620,6 +621,7 @@ class ScaleShiftMACExTB(MACE):
         self.parallel_units_pair = parallel_units_pair
         self.separate_output_heads = separate_output_heads
         self.use_custom_ranges = use_custom_ranges
+        self.scatter_method = scatter_method
         
         # Check if custom ranges can be used
         if self.use_custom_ranges and not self.separate_output_heads:
@@ -856,7 +858,10 @@ class ScaleShiftMACExTB(MACE):
             params_pred = params_pred[output_indices]
 
         #### Compute global parameters #### 
-        global_feats = scatter_mean(src=node_feats_out, index=data["batch"], dim=0, dim_size=num_graphs)
+        if self.scatter_method == "scatter_mean":
+            global_feats = scatter_mean(src=node_feats_out, index=data["batch"], dim=0, dim_size=num_graphs)
+        else:  # scatter_sum
+            global_feats = scatter_sum(src=node_feats_out, index=data["batch"], dim=0, dim_size=num_graphs)
 
         scale_globpar = self.scale_predictor_globpar(global_feats)
         shift_globpar = self.shift_predictor_globpar(global_feats)
@@ -1693,6 +1698,7 @@ class EquivariantScaleShiftMACExTB(MACE):
         separate_output_heads: bool = True,
         use_custom_ranges: bool = False,
         equivariant_feat_len: int = 64,  # Add predefined feature length
+        scatter_method: str = "scatter_mean",
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -1725,6 +1731,7 @@ class EquivariantScaleShiftMACExTB(MACE):
         self.parallel_units_pair = parallel_units_pair
         self.separate_output_heads = separate_output_heads
         self.use_custom_ranges = use_custom_ranges
+        self.scatter_method = scatter_method
         
         # Check custom ranges compatibility
         if self.use_custom_ranges and not self.separate_output_heads:
@@ -2090,7 +2097,10 @@ class EquivariantScaleShiftMACExTB(MACE):
                 node_global_feats = scalar_features
             
             # Pool over nodes in each graph to get graph-level features
-            global_feats = scatter_mean(src=node_global_feats, index=data["batch"], dim=0, dim_size=num_graphs)
+            if self.scatter_method == "scatter_mean":
+                global_feats = scatter_mean(src=node_global_feats, index=data["batch"], dim=0, dim_size=num_graphs)
+            else:  # scatter_sum
+                global_feats = scatter_sum(src=node_global_feats, index=data["batch"], dim=0, dim_size=num_graphs)
 
             # scale_globpar = self.scale_predictor_globpar(global_feats) if self.scale_predictor_globpar is not None else None
             # shift_globpar = self.shift_predictor_globpar(global_feats) if self.shift_predictor_globpar is not None else None

@@ -17,14 +17,19 @@ class Collater:
     def __call__(self, batch):
         elem = batch[0]
         print(f"elem: {elem}")
+        
+        if isinstance(elem, Sequence) and all(isinstance(item, Sequence) for item in elem):
+            # Process the first element as a nested list of Data, while handling the rest as normal tensors
+            first_elem = [datapoint[0] for dataframe in batch for datapoint in dataframe]
+            return [first_elem] 
+        
+        
         if isinstance(elem, Data):
-            # print(f'self.follow_batch: {self.follow_batch}')
             return Batch.from_data_list(
                 batch,
                 follow_batch=self.follow_batch,
                 exclude_keys=self.exclude_keys,
             )
-            return batch
         elif isinstance(elem, torch.Tensor):
             return default_collate(batch)
         elif isinstance(elem, float):
@@ -35,11 +40,19 @@ class Collater:
             return batch
         elif isinstance(elem, Mapping):
             return {key: self([data[key] for data in batch]) for key in elem}
-        elif isinstance(elem, tuple) and hasattr(elem, "_fields"):
+        elif isinstance(elem, tuple) and hasattr(elem, "_fields"): # recursive
             return type(elem)(*(self(s) for s in zip(*batch)))
-        elif isinstance(elem, Sequence) and all(isinstance(item, Data) for item in elem):   # Yufan modification
+        elif isinstance(elem, Sequence) and all(isinstance(item, Data) for item in elem):
             print('Yufan modification')
             return batch
+        elif isinstance(elem, Sequence) and all(isinstance(item, Sequence) for item in elem):
+            print('Yufan modification, new added')
+            max_length = max(len(sublist) for sublist, _, _ in batch)
+            padded_batch = [
+                (sublist + [None] * (max_length - len(sublist)), idx1, idx2)
+                for sublist, idx1, idx2 in batch
+            ]
+            return padded_batch
         elif isinstance(elem, Sequence) and not isinstance(elem, str):
             return [self(s) for s in zip(*batch)]
         
@@ -47,6 +60,22 @@ class Collater:
 
     def collate(self, batch):  # Deprecated...
         return self(batch)
+
+# class Collater:
+#     def __init__(self, follow_batch, exclude_keys):
+#         self.follow_batch = follow_batch
+#         self.exclude_keys = exclude_keys
+
+#     def __call__(self, batch):
+#         print(f"batch: {batch}")
+#         if isinstance(batch[0], Sequence) and all(isinstance(item, Sequence) for item in batch[0]):
+#             return batch
+#         else:
+#             raise TypeError(f"DataLoader found invalid type: {type(batch[0])}")
+        
+#     def collate(self, batch):  # Deprecated...
+#         return self(batch)
+
 
 
 class DataLoader(torch.utils.data.DataLoader):

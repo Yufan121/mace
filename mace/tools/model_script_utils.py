@@ -201,6 +201,7 @@ def _build_model(
             half_range_pt=args.half_range_pt,
             half_range_pt_globpar=args.half_range_pt_globpar,
             half_range_pt_pair=args.half_range_pt_pair,
+            scatter_method=args.scatter_method,
             
         )
     if args.model == "EquivariantScaleShiftMACExTB":
@@ -228,6 +229,7 @@ def _build_model(
             parallel_units_pair=getattr(args, 'parallel_units_pair', 640),
             separate_output_heads=getattr(args, 'separate_output_heads', True),
             use_custom_ranges=getattr(args, 'use_custom_ranges', False),
+            scatter_method=args.scatter_method,
         )
     if args.model == "FoundationMACE":
         model_config_foundation["use_layer_norm"] = args.interaction_use_layer_norm
