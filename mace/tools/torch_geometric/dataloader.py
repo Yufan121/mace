@@ -16,7 +16,7 @@ class Collater:
 
     def __call__(self, batch):
         elem = batch[0]
-        print(f"elem: {elem}")
+        # print(f"elem: {elem}")
         
         if isinstance(elem, Sequence) and all(isinstance(item, Sequence) for item in elem):
             # Process the first element as a nested list of Data, while handling the rest as normal tensors
@@ -43,10 +43,10 @@ class Collater:
         elif isinstance(elem, tuple) and hasattr(elem, "_fields"): # recursive
             return type(elem)(*(self(s) for s in zip(*batch)))
         elif isinstance(elem, Sequence) and all(isinstance(item, Data) for item in elem):
-            print('Yufan modification')
+            # print('Yufan modification')
             return batch
         elif isinstance(elem, Sequence) and all(isinstance(item, Sequence) for item in elem):
-            print('Yufan modification, new added')
+            # print('Yufan modification, new added')
             max_length = max(len(sublist) for sublist, _, _ in batch)
             padded_batch = [
                 (sublist + [None] * (max_length - len(sublist)), idx1, idx2)

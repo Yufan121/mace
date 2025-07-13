@@ -574,11 +574,12 @@ class ScaleShiftMACExTB(MACE):
         half_range_pt = None,
         half_range_pt_globpar = None,
         half_range_pt_pair = None,
-        parallel_units_elempar: int = 640,
-        parallel_units_globpar: int = 640,
-        parallel_units_pair: int = 640,
+        parallel_units_elempar: int = 128,
+        parallel_units_globpar: int = 128,
+        parallel_units_pair: int = 128,
         separate_output_heads: bool = True,
         use_custom_ranges: bool = False,
+        use_scale_predictor: bool = False,
         scatter_method: str = "scatter_mean",
         **kwargs,
     ):
@@ -613,7 +614,7 @@ class ScaleShiftMACExTB(MACE):
 
         
         # only one of the three can be True
-        assert sum([elemnet, globnet, pairnet]) == 1, f"Only one of the three can be True: {elemnet}, {globnet}, {pairnet}"
+        # assert sum([elemnet, globnet, pairnet]) == 1, f"Only one of the three can be True: {elemnet}, {globnet}, {pairnet}"
         
         # Set parallel units
         self.parallel_units_elempar = parallel_units_elempar
@@ -621,6 +622,7 @@ class ScaleShiftMACExTB(MACE):
         self.parallel_units_pair = parallel_units_pair
         self.separate_output_heads = separate_output_heads
         self.use_custom_ranges = use_custom_ranges
+        self.use_scale_predictor = use_scale_predictor
         self.scatter_method = scatter_method
         
         # Check if custom ranges can be used
@@ -649,11 +651,17 @@ class ScaleShiftMACExTB(MACE):
         # Define output activation
         self.out = torch.nn.Identity()
         
-        # Create scale and shift predictors
-        self.scale_predictor = self._create_predictor(cnt_size, self.outdim)
-        self.shift_predictor = self._create_predictor(cnt_size, self.outdim, use_softplus=False)
-        self.scale_predictor_globpar = self._create_predictor(cnt_size, self.outdim_globpar)
-        self.shift_predictor_globpar = self._create_predictor(cnt_size, self.outdim_globpar, use_softplus=False)
+        # Create scale and shift predictors only if enabled
+        if self.use_scale_predictor:
+            self.scale_predictor = self._create_predictor(cnt_size, self.outdim)
+            self.shift_predictor = self._create_predictor(cnt_size, self.outdim, use_softplus=False)
+            self.scale_predictor_globpar = self._create_predictor(cnt_size, self.outdim_globpar)
+            self.shift_predictor_globpar = self._create_predictor(cnt_size, self.outdim_globpar, use_softplus=False)
+        else:
+            self.scale_predictor = None
+            self.shift_predictor = None
+            self.scale_predictor_globpar = None
+            self.shift_predictor_globpar = None
 
     def _create_output_heads(self, outdim, parallel_units, cnt_size, block_type=ResidualBlock):
         # Helper function to create separate output heads
@@ -690,7 +698,8 @@ class ScaleShiftMACExTB(MACE):
 
     def _print_grad_hook(self, grad: torch.Tensor, name: str):
         # Helper function for gradient hooks
-        print(f"--- Gradient Stats for {name} ---" + (f"\n  - Norm: {grad.norm().item():.4e}\n  - Mean: {grad.mean().item():.4e}\n  - Max Abs: {grad.abs().max().item():.4e}\n  - Has NaN: {torch.isnan(grad).any().item()}\n  - Has Inf: {torch.isinf(grad).any().item()}" if grad is not None else "\n--- No gradient computed for {name} ---"))
+        # print(f"--- Gradient Stats for {name} ---" + (f"\n  - Norm: {grad.norm().item():.4f}\n  - Mean: {grad.mean().item():.4f}\n  - Max Abs: {grad.abs().max().item():.4f}\n  - Has NaN: {torch.isnan(grad).any().item()}\n  - Has Inf: {torch.isinf(grad).any().item()}" if grad is not None else "\n--- No gradient computed for {name} ---"))
+        print(f"--- Gradient Stats ---\n  - Norm: {grad.norm().item():.4f}\n  - Mean: {grad.mean().item():.4f}\n  - Max Abs: {grad.abs().max().item():.4f}\n  - Has NaN: {torch.isnan(grad).any().item()}\n  - Has Inf: {torch.isinf(grad).any().item()}")
 
     def forward(
         self,
@@ -757,9 +766,9 @@ class ScaleShiftMACExTB(MACE):
             node_feats_list.append(node_feats)
             node_es_list.append(readout(node_feats, node_heads)[num_atoms_arange, node_heads])
 
-            if training:
-                node_feats_list[-1].register_hook(lambda grad: self._print_grad_hook(grad, f"node_feats_list[-1]"))
-                node_es_list[-1].register_hook(lambda grad: self._print_grad_hook(grad, f"node_es_list[-1]"))
+            # if training:
+                # node_feats_list[-1].register_hook(lambda grad: self._print_grad_hook(grad, f"node_feats_list[-1]"))
+                # node_es_list[-1].register_hook(lambda grad: self._print_grad_hook(grad, f"node_es_list[-1]"))
                 
             
 
@@ -792,9 +801,13 @@ class ScaleShiftMACExTB(MACE):
         
         # print(f'node_feats_out.shape after concat: {node_feats_out.shape}')
         
-        # Predict scale and shift
-        scale = self.scale_predictor(node_feats_out)
-        shift = self.shift_predictor(node_feats_out)
+        # Predict scale and shift only if enabled
+        if self.use_scale_predictor:
+            scale = self.scale_predictor(node_feats_out)
+            shift = self.shift_predictor(node_feats_out)
+        else:
+            scale = None
+            shift = None
 
         #### Compute element parameters #### 
         if self.separate_output_heads:
@@ -863,8 +876,12 @@ class ScaleShiftMACExTB(MACE):
         else:  # scatter_sum
             global_feats = scatter_sum(src=node_feats_out, index=data["batch"], dim=0, dim_size=num_graphs)
 
-        scale_globpar = self.scale_predictor_globpar(global_feats)
-        shift_globpar = self.shift_predictor_globpar(global_feats)
+        if self.use_scale_predictor:
+            scale_globpar = self.scale_predictor_globpar(global_feats)
+            shift_globpar = self.shift_predictor_globpar(global_feats)
+        else:
+            scale_globpar = None
+            shift_globpar = None
 
         if self.separate_output_heads:
             outputs_globpar = [head(global_feats) for head in self.output_globpar_heads]
@@ -1692,11 +1709,12 @@ class EquivariantScaleShiftMACExTB(MACE):
         half_range_pt = None,
         half_range_pt_globpar = None,
         half_range_pt_pair = None,
-        parallel_units_elempar: int = 640,
-        parallel_units_globpar: int = 640,
-        parallel_units_pair: int = 640,
+        parallel_units_elempar: int = 100,
+        parallel_units_globpar: int = 100,
+        parallel_units_pair: int = 100,
         separate_output_heads: bool = True,
         use_custom_ranges: bool = False,
+        use_scale_predictor: bool = False,
         equivariant_feat_len: int = 64,  # Add predefined feature length
         scatter_method: str = "scatter_mean",
         **kwargs,
@@ -1731,6 +1749,7 @@ class EquivariantScaleShiftMACExTB(MACE):
         self.parallel_units_pair = parallel_units_pair
         self.separate_output_heads = separate_output_heads
         self.use_custom_ranges = use_custom_ranges
+        self.use_scale_predictor = use_scale_predictor
         self.scatter_method = scatter_method
         
         # Check custom ranges compatibility
@@ -1821,18 +1840,24 @@ class EquivariantScaleShiftMACExTB(MACE):
                     self.outdim_pair, self.parallel_units_pair, self.final_node_irreps
                 )
         
-        # Create equivariant scale and shift predictors
-        if self.outdim > 0:
-            self.scale_predictor = self._create_equivariant_predictor(self.final_node_irreps, self.outdim)
-            self.shift_predictor = self._create_equivariant_predictor(self.final_node_irreps, self.outdim)
+        # Create equivariant scale and shift predictors only if enabled
+        if self.use_scale_predictor:
+            if self.outdim > 0:
+                self.scale_predictor = self._create_equivariant_predictor(self.final_node_irreps, self.outdim)
+                self.shift_predictor = self._create_equivariant_predictor(self.final_node_irreps, self.outdim)
+            else:
+                self.scale_predictor = None
+                self.shift_predictor = None
+            
+            if self.globnet:
+                self.scale_predictor_globpar = self._create_equivariant_predictor(self.final_global_irreps, self.outdim_globpar)
+                self.shift_predictor_globpar = self._create_equivariant_predictor(self.final_global_irreps, self.outdim_globpar)
+            else:
+                self.scale_predictor_globpar = None
+                self.shift_predictor_globpar = None
         else:
             self.scale_predictor = None
             self.shift_predictor = None
-        
-        if self.globnet:
-            self.scale_predictor_globpar = self._create_equivariant_predictor(self.final_global_irreps, self.outdim_globpar)
-            self.shift_predictor_globpar = self._create_equivariant_predictor(self.final_global_irreps, self.outdim_globpar)
-        else:
             self.scale_predictor_globpar = None
             self.shift_predictor_globpar = None
 
@@ -1937,7 +1962,8 @@ class EquivariantScaleShiftMACExTB(MACE):
 
     def _print_grad_hook(self, grad: torch.Tensor, name: str):
         # Helper function for gradient hooks
-        print(f"--- Gradient Stats for {name} ---" + (f"\n  - Norm: {grad.norm().item():.4f}\n  - Mean: {grad.mean().item():.4f}\n  - Max Abs: {grad.abs().max().item():.4f}\n  - Has NaN: {torch.isnan(grad).any().item()}\n  - Has Inf: {torch.isinf(grad).any().item()}" if grad is not None else "\n--- No gradient computed for {name} ---"))
+        # print(f"--- Gradient Stats for {name} ---" + (f"\n  - Norm: {grad.norm().item():.4f}\n  - Mean: {grad.mean().item():.4f}\n  - Max Abs: {grad.abs().max().item():.4f}\n  - Has NaN: {torch.isnan(grad).any().item()}\n  - Has Inf: {torch.isinf(grad).any().item()}" if grad is not None else "\n--- No gradient computed for {name} ---"))
+        print(f"--- Gradient Stats ---\n  - Norm: {grad.norm().item():.4f}\n  - Mean: {grad.mean().item():.4f}\n  - Max Abs: {grad.abs().max().item():.4f}\n  - Has NaN: {torch.isnan(grad).any().item()}\n  - Has Inf: {torch.isinf(grad).any().item()}")
 
     def forward(
         self,
@@ -2005,9 +2031,9 @@ class EquivariantScaleShiftMACExTB(MACE):
             node_feats_list.append(node_feats)
             node_es_list.append(readout(node_feats, node_heads)[num_atoms_arange, node_heads])
 
-            if training:
-                node_feats_list[-1].register_hook(lambda grad: self._print_grad_hook(grad, f"equivariant_node_feats_list[-1]"))
-                node_es_list[-1].register_hook(lambda grad: self._print_grad_hook(grad, f"equivariant_node_es_list[-1]"))
+            # if training:
+                # node_feats_list[-1].register_hook(lambda grad: self._print_grad_hook(grad, f"equivariant_node_feats_list[-1]"))
+                # node_es_list[-1].register_hook(lambda grad: self._print_grad_hook(grad, f"equivariant_node_es_list[-1]"))
 
             if save_intermediate:
                 os.makedirs(save_dir, exist_ok=True)
@@ -2025,8 +2051,8 @@ class EquivariantScaleShiftMACExTB(MACE):
         # Extract scalar features from MACE output and project to our predefined dimension
         scalar_features = self._extract_and_project_scalars(node_feats_out)
         
-        if training and scalar_features.requires_grad:
-            scalar_features.register_hook(lambda grad: self._print_grad_hook(grad, "equivariant_scalar_features"))
+        # if training and scalar_features.requires_grad:
+        #     scalar_features.register_hook(lambda grad: self._print_grad_hook(grad, "equivariant_scalar_features"))
         
         # Predict scale and shift (using scalar features only)
         # scale = self.scale_predictor(scalar_features) if self.scale_predictor is not None else None
