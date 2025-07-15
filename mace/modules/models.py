@@ -580,7 +580,7 @@ class ScaleShiftMACExTB(MACE):
         separate_output_heads: bool = True,
         use_custom_ranges: bool = False,
         use_scale_predictor: bool = False,
-        scatter_method: str = "scatter_mean",
+        scatter_method: str = "scatter_sum",
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -1716,7 +1716,7 @@ class EquivariantScaleShiftMACExTB(MACE):
         use_custom_ranges: bool = False,
         use_scale_predictor: bool = False,
         equivariant_feat_len: int = 64,  # Add predefined feature length
-        scatter_method: str = "scatter_mean",
+        scatter_method: str = "scatter_sum",
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -1740,8 +1740,8 @@ class EquivariantScaleShiftMACExTB(MACE):
         self.globnet = globnet
         self.pairnet = pairnet
         
-        # Only one of the three can be True
-        assert sum([elemnet, globnet, pairnet]) == 1, f"Only one of the three can be True: {elemnet}, {globnet}, {pairnet}"
+        # # Only one of the three can be True
+        # assert sum([elemnet, globnet, pairnet]) == 1, f"Only one of the three can be True: {elemnet}, {globnet}, {pairnet}"
         
         # Set parallel units and other parameters
         self.parallel_units_elempar = parallel_units_elempar
