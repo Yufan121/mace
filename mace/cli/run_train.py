@@ -1215,7 +1215,8 @@ def get_model_and_loader(args: argparse.Namespace):
         )
 
     loss_fn = get_loss_fn(args, dipole_only, args.compute_dipole)
-    args.avg_num_neighbors = get_avg_num_neighbors(head_configs, args, train_loader, device)
+    # args.avg_num_neighbors = get_avg_num_neighbors(head_configs, args, train_loader, device)
+    args.avg_num_neighbors = 13
 
     # Model
     model, output_args = configure_model(args, train_loader, atomic_energies, model_foundation, heads, z_table)
