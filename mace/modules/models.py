@@ -635,8 +635,8 @@ class ScaleShiftMACExTB(MACE):
         self.half_range_pt_pair = torch.tensor(half_range_pt_pair or [0.05] * self.outdim_pair, dtype=torch.get_default_dtype())
 
         # Define connecting layer size
-        cnt_size = 64 + 100        # TODO
-        # cnt_size = 128 + 2
+        # cnt_size = 256 + 35        # TODO
+        cnt_size = 64 + 100
         
         # Create output heads
         if self.separate_output_heads:
@@ -1713,6 +1713,7 @@ class EquivariantScaleShiftMACExTB(MACE):
         parallel_units_globpar: int = 100,
         parallel_units_pair: int = 100,
         separate_output_heads: bool = True,
+        separate_element_heads: bool = True,
         use_custom_ranges: bool = False,
         use_scale_predictor: bool = False,
         equivariant_feat_len: int = 64,  # Add predefined feature length
@@ -1748,6 +1749,7 @@ class EquivariantScaleShiftMACExTB(MACE):
         self.parallel_units_globpar = parallel_units_globpar
         self.parallel_units_pair = parallel_units_pair
         self.separate_output_heads = separate_output_heads
+        self.separate_element_heads = separate_element_heads
         self.use_custom_ranges = use_custom_ranges
         self.use_scale_predictor = use_scale_predictor
         self.scatter_method = scatter_method
@@ -1756,11 +1758,34 @@ class EquivariantScaleShiftMACExTB(MACE):
         if self.use_custom_ranges and not self.separate_output_heads:
             raise ValueError("Elem & parameter custom ranges can only be used with separate_output_heads=True")
         
+        
+        # Setup element-specific head information
+        # Always set num_elements and element_to_idx first
+        self.num_elements = len(self.atomic_numbers) if hasattr(self, 'atomic_numbers') else None
+        self.element_to_idx = {z.item(): i for i, z in enumerate(self.atomic_numbers)} if hasattr(self, 'atomic_numbers') else None
+        
+        
+        
+        if self.num_elements is None or self.element_to_idx is None:
+            raise ValueError("atomic_numbers is not set")
+
+        
         # Initialize half range parameters and register as buffers for proper device handling
-        self.register_buffer(
-            "half_range_pt",
-            torch.tensor(half_range_pt or [0.05] * self.outdim, dtype=torch.get_default_dtype())
-        )
+        if self.separate_element_heads and self.outdim > 0:
+            # Create element-specific ranges: (num_elements, outdim)
+            base_range = half_range_pt or [0.05] * self.outdim
+            element_ranges = [base_range for _ in range(self.num_elements)]
+            self.register_buffer(
+                "half_range_pt",
+                torch.tensor(element_ranges, dtype=torch.get_default_dtype())
+            )
+        else:
+            # Original single range for all elements: (outdim,)
+            self.register_buffer(
+                "half_range_pt",
+                torch.tensor(half_range_pt or [0.05] * self.outdim, dtype=torch.get_default_dtype())
+            )
+        
         self.register_buffer(
             "half_range_pt_globpar", 
             torch.tensor(half_range_pt_globpar or [0.05] * self.outdim_globpar, dtype=torch.get_default_dtype())
@@ -1776,6 +1801,14 @@ class EquivariantScaleShiftMACExTB(MACE):
         # Set final irreps based on predefined feature length
         self.final_node_irreps = o3.Irreps(f"{equivariant_feat_len}x0e")  # Use predefined scalar features
         self.final_global_irreps = o3.Irreps("64x0e")  # Global scalar features
+        
+        
+        if self.separate_element_heads and self.outdim > 0:
+            # Reduce head size since we'll have num_elements * outdim heads
+            # self.elempar_head_units = max(20, parallel_units_elempar // max(1, self.num_elements))
+            self.elempar_head_units = 100
+        else:
+            self.elempar_head_units = parallel_units_elempar
         
         # Create scalar projection layer (from MACE features to our scalar features)
         # We'll assume MACE outputs have some scalar features, we'll project them
@@ -1811,9 +1844,14 @@ class EquivariantScaleShiftMACExTB(MACE):
         # Create equivariant output heads
         if self.separate_output_heads:
             if self.outdim > 0:
-                self.output_heads = self._create_equivariant_output_heads(
-                    self.outdim, self.parallel_units_elempar, self.final_node_irreps
-                )
+                if self.separate_element_heads:
+                    self.output_heads = self._create_element_specific_heads(
+                        self.outdim, self.elempar_head_units, self.final_node_irreps
+                    )
+                else:
+                    self.output_heads = self._create_equivariant_output_heads(
+                        self.outdim, self.parallel_units_elempar, self.final_node_irreps
+                    )
                 
             if self.globnet:
                 self.output_globpar_heads = self._create_equivariant_output_heads(
@@ -1826,9 +1864,14 @@ class EquivariantScaleShiftMACExTB(MACE):
                 )
         else:
             if self.outdim > 0:
-                self.output_head = self._create_equivariant_combined_head(
-                    self.outdim, self.parallel_units_elempar, self.final_node_irreps
-                )
+                if self.separate_element_heads:
+                    self.output_head = self._create_element_specific_combined_heads(
+                        self.outdim, self.elempar_head_units, self.final_node_irreps
+                    )
+                else:
+                    self.output_head = self._create_equivariant_combined_head(
+                        self.outdim, self.parallel_units_elempar, self.final_node_irreps
+                    )
                 
             if self.globnet:
                 self.output_globpar_head = self._create_equivariant_combined_head(
@@ -1886,6 +1929,7 @@ class EquivariantScaleShiftMACExTB(MACE):
                         ).to(node_feats.device)
                     scalar_features = self._scalar_projection_layer(scalar_features)
             else:
+                raise ValueError("No scalar features found")
                 # No scalar features, create them from a simple projection
                 if not hasattr(self, '_scalar_creation_layer') or self._scalar_creation_layer is None:
                     self._scalar_creation_layer = torch.nn.Linear(
@@ -1960,10 +2004,63 @@ class EquivariantScaleShiftMACExTB(MACE):
             nn.Activation(irreps_in=output_irreps, acts=[torch.nn.functional.softplus])  # For scale prediction
         )
 
+    def _create_element_specific_heads(self, outdim, parallel_units, input_irreps):
+        """Create element-specific separate output heads"""
+        if outdim == 0:
+            return torch.nn.ModuleList()
+            
+        # Create intermediate irreps for hidden layers (mainly scalars)
+        hidden_irreps = o3.Irreps(f"{parallel_units}x0e")
+        output_irreps = o3.Irreps("1x0e")  # Single scalar output
+        
+        heads = []
+        # Create num_elements * outdim heads (flattened structure)
+        for element_idx in range(self.num_elements):
+            for param_idx in range(outdim):
+                head = torch.nn.Sequential(
+                    EquivariantResidualBlock(input_irreps, hidden_irreps),
+                    EquivariantResidualBlock(hidden_irreps, hidden_irreps),
+                    EquivariantResidualBlock(hidden_irreps, hidden_irreps),
+                    o3.Linear(hidden_irreps, output_irreps, internal_weights=True, shared_weights=True)
+                )
+                heads.append(head)
+        
+        return torch.nn.ModuleList(heads)
+
+    def _create_element_specific_combined_heads(self, outdim, parallel_units, input_irreps):
+        """Create element-specific combined output heads"""
+        if outdim == 0:
+            return None
+        
+        # Create intermediate irreps
+        hidden_irreps = o3.Irreps(f"{parallel_units}x0e")
+        output_irreps = o3.Irreps(f"{outdim}x0e")  # Multiple scalar outputs
+        
+        heads = []
+        # Create one combined head per element
+        for element_idx in range(self.num_elements):
+            head = torch.nn.Sequential(
+                EquivariantResidualBlock(input_irreps, hidden_irreps),
+                EquivariantResidualBlock(hidden_irreps, hidden_irreps),
+                EquivariantResidualBlock(hidden_irreps, hidden_irreps),
+                o3.Linear(hidden_irreps, output_irreps, internal_weights=True, shared_weights=True)
+            )
+            heads.append(head)
+        
+        return torch.nn.ModuleList(heads)
+
     def _print_grad_hook(self, grad: torch.Tensor, name: str):
         # Helper function for gradient hooks
         # print(f"--- Gradient Stats for {name} ---" + (f"\n  - Norm: {grad.norm().item():.4f}\n  - Mean: {grad.mean().item():.4f}\n  - Max Abs: {grad.abs().max().item():.4f}\n  - Has NaN: {torch.isnan(grad).any().item()}\n  - Has Inf: {torch.isinf(grad).any().item()}" if grad is not None else "\n--- No gradient computed for {name} ---"))
         print(f"--- Gradient Stats ---\n  - Norm: {grad.norm().item():.4f}\n  - Mean: {grad.mean().item():.4f}\n  - Max Abs: {grad.abs().max().item():.4f}\n  - Has NaN: {torch.isnan(grad).any().item()}\n  - Has Inf: {torch.isinf(grad).any().item()}")
+
+
+
+
+
+
+
+
 
     def forward(
         self,
@@ -1981,6 +2078,13 @@ class EquivariantScaleShiftMACExTB(MACE):
         # Setup and gradient requirements
         data["positions"].requires_grad_(True)
         data["node_attrs"].requires_grad_(True)
+        
+        
+        # print num_elements and element_to_idx and node_attrs
+        print(f"num_elements: {self.num_elements}")
+        print(f"element_to_idx: {self.element_to_idx}")
+        print(f"all atomic_numbers: {self.atomic_numbers}")
+
         
         num_graphs = data["ptr"].numel() - 1
         num_atoms_arange = torch.arange(data["positions"].shape[0])
@@ -2003,7 +2107,7 @@ class EquivariantScaleShiftMACExTB(MACE):
 
         # Compute atomic energies
         node_e0 = self.atomic_energies_fn(data["node_attrs"])[num_atoms_arange, node_heads]
-        e0 = scatter_sum(src=node_e0, index=data["batch"], dim=0, dim_size=num_graphs)
+        # e0 = scatter_sum(src=node_e0, index=data["batch"], dim=0, dim_size=num_graphs)
 
         # Compute embeddings and edge features
         node_feats = self.node_embedding(data["node_attrs"])
@@ -2060,10 +2164,49 @@ class EquivariantScaleShiftMACExTB(MACE):
 
         #### Compute element parameters #### 
         if self.separate_output_heads and self.output_heads is not None:
-            outputs = [head(scalar_features) for head in self.output_heads]
-            params_pred_raw = torch.cat(outputs, dim=1) if outputs else None
+            if self.separate_element_heads:
+                # Route atoms to element-specific heads efficiently
+                atomic_numbers = self.atomic_numbers[data["node_attrs"].argmax(dim=1)]
+                print(f"atomic_numbers: {atomic_numbers}")
+                params_pred_raw = torch.zeros(scalar_features.shape[0], self.outdim, 
+                                            device=scalar_features.device, dtype=scalar_features.dtype)
+                
+                # Group atoms by element for efficient processing
+                for element_z, element_idx in self.element_to_idx.items():
+                    element_mask = (atomic_numbers == element_z)
+                    
+                    if element_mask.any():
+                        element_features = scalar_features[element_mask]
+                        
+                        # Apply element-specific heads for all atoms of this element
+                        element_outputs = []
+                        for param_idx in range(self.outdim):
+                            head_idx = element_idx * self.outdim + param_idx
+                            param_output = self.output_heads[head_idx](element_features)
+                            element_outputs.append(param_output)
+                        
+                        # Combine outputs and assign back
+                        element_params = torch.cat(element_outputs, dim=1)
+                        params_pred_raw[element_mask] = element_params
+            else:
+                outputs = [head(scalar_features) for head in self.output_heads]
+                params_pred_raw = torch.cat(outputs, dim=1) if outputs else None
         else:
-            params_pred_raw = self.output_head(scalar_features) if self.output_head is not None else None
+            if self.separate_element_heads and self.output_head is not None:
+                # Route atoms to element-specific combined heads efficiently
+                atomic_numbers = self.atomic_numbers[data["node_attrs"].argmax(dim=1)]
+                params_pred_raw = torch.zeros(scalar_features.shape[0], self.outdim, 
+                                            device=scalar_features.device, dtype=scalar_features.dtype)
+                
+                # Group atoms by element for efficient processing
+                for element_z, element_idx in self.element_to_idx.items():
+                    element_mask = (atomic_numbers == element_z)
+                    if element_mask.any():
+                        element_features = scalar_features[element_mask]
+                        element_output = self.output_head[element_idx](element_features)
+                        params_pred_raw[element_mask] = element_output
+            else:
+                params_pred_raw = self.output_head(scalar_features) if self.output_head is not None else None
 
         if training and params_pred_raw is not None and params_pred_raw.requires_grad:  # debug hook
             params_pred_raw.register_hook(lambda grad: self._print_grad_hook(grad, "equivariant_params_pred_raw"))
@@ -2072,7 +2215,7 @@ class EquivariantScaleShiftMACExTB(MACE):
         if save_intermediate and params_pred_raw is not None:
             np.save(f"{save_dir}/equivariant_params_pred_raw.npy", params_pred_raw.detach().cpu().numpy())
 
-        # Apply range constraints (same as original)
+        # # Apply range constraints
         params_pred = params_pred_raw
         if params_pred_raw is not None:
             if self.use_custom_ranges:
@@ -2099,13 +2242,36 @@ class EquivariantScaleShiftMACExTB(MACE):
                         if param_idx < params_pred_raw.shape[1]:
                             included_mask[:, param_idx] = True
                 
-                params_pred = torch.where(
-                    included_mask,
-                    torch.nn.functional.tanh(params_pred_raw * 0.1) * deltas,
-                    params_pred_raw * self.half_range_pt
-                )
+                # Apply element-specific ranges for custom ranges case
+                if self.separate_element_heads:
+                    atomic_numbers = self.atomic_numbers[data["node_attrs"].argmax(dim=1)]
+                    element_ranges = torch.zeros_like(params_pred_raw)
+                    for i, atom_z in enumerate(atomic_numbers):
+                        element_idx = self.element_to_idx[atom_z.item()]
+                        element_ranges[i] = self.half_range_pt[element_idx]
+                    
+                    params_pred = torch.where(
+                        included_mask,
+                        torch.nn.functional.tanh(params_pred_raw * 0.1) * deltas,
+                        params_pred_raw * element_ranges
+                    )
+                else:
+                    params_pred = torch.where(
+                        included_mask,
+                        torch.nn.functional.tanh(params_pred_raw * 0.1) * deltas,
+                        params_pred_raw * self.half_range_pt
+                    )
             else:
-                params_pred = self.out(params_pred) * self.half_range_pt
+                # Apply element-specific ranges for standard case
+                if self.separate_element_heads:
+                    atomic_numbers = self.atomic_numbers[data["node_attrs"].argmax(dim=1)]
+                    element_ranges = torch.zeros_like(params_pred_raw)
+                    for i, atom_z in enumerate(atomic_numbers):
+                        element_idx = self.element_to_idx[atom_z.item()]
+                        element_ranges[i] = self.half_range_pt[element_idx]
+                    params_pred = self.out(params_pred) * element_ranges
+                else:
+                    params_pred = self.out(params_pred) * self.half_range_pt
 
         if output_indices is not None and params_pred is not None:
             params_pred = params_pred[output_indices]
@@ -2173,6 +2339,8 @@ class EquivariantScaleShiftMACExTB(MACE):
             else:
                 pair_params = None
 
+
+
         # Prepare output dictionary
         output = {
             "params_pred": params_pred,
@@ -2180,6 +2348,10 @@ class EquivariantScaleShiftMACExTB(MACE):
             "node_feats": scalar_features,  # Return scalar features
             "pair_param": pair_params,
         }
+        
+        
+        
+        # print(f"output: {output}")
 
         return output
 
