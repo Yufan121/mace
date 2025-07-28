@@ -231,6 +231,58 @@ def _build_model(
             use_custom_ranges=getattr(args, 'use_custom_ranges', False),
             scatter_method=args.scatter_method,
         )
+    if args.model == "ElementSpecificEquivariantMACExTB":
+        # Build shared configuration that all element models will use
+        shared_config = {
+            **model_config,
+            "pair_repulsion": args.pair_repulsion,
+            "distance_transform": args.distance_transform,
+            "correlation": args.correlation,
+            "gate": modules.gate_dict[args.gate],
+            "interaction_cls_first": modules.interaction_classes[args.interaction_first],
+            "MLP_irreps": o3.Irreps(args.MLP_irreps),
+            "atomic_inter_scale": args.std,
+            "atomic_inter_shift": args.mean,
+            "radial_MLP": ast.literal_eval(args.radial_MLP),
+            "radial_type": args.radial_type,
+            "heads": heads,
+            "outdim": args.outdim,
+            "outdim_globpar": args.outdim_globpar,
+            "outdim_pair": args.outdim_pair,
+            "half_range_pt": args.half_range_pt,
+            "half_range_pt_globpar": args.half_range_pt_globpar,
+            "half_range_pt_pair": args.half_range_pt_pair,
+            "parallel_units_elempar": getattr(args, 'parallel_units_elempar', 100),
+            "parallel_units_globpar": getattr(args, 'parallel_units_globpar', 100),
+            "parallel_units_pair": getattr(args, 'parallel_units_pair', 100),
+            "separate_output_heads": getattr(args, 'separate_output_heads', True),
+            "separate_element_heads": getattr(args, 'separate_element_heads', True),
+            "use_custom_ranges": getattr(args, 'use_custom_ranges', False),
+            "use_scale_predictor": getattr(args, 'use_scale_predictor', False),
+            "equivariant_feat_len": getattr(args, 'equivariant_feat_len', 64),
+            "scatter_method": args.scatter_method,
+        }
+        
+        # Build element-specific configurations
+        element_configs = {}
+        for atomic_number in model_config["atomic_numbers"]:
+            element_configs[atomic_number.item()] = {
+                # You can add element-specific parameters here
+                # For example, different atomic energies, network sizes, etc.
+                # The shared_config will be merged with these element-specific configs
+            }
+        
+        # If you have element-specific arguments, you can process them here
+        # For example:
+        # if hasattr(args, 'element_specific_configs'):
+        #     for z, config in args.element_specific_configs.items():
+        #         if z in element_configs:
+        #             element_configs[z].update(config)
+        
+        return modules.ElementSpecificEquivariantMACExTB(
+            element_configs=element_configs,
+            shared_config=shared_config,
+        )
     if args.model == "FoundationMACE":
         model_config_foundation["use_layer_norm"] = args.interaction_use_layer_norm
         return modules.ScaleShiftMACE(**model_config_foundation)

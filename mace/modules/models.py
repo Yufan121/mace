@@ -2355,3 +2355,407 @@ class EquivariantScaleShiftMACExTB(MACE):
 
         return output
 
+
+
+@compile_mode("script")
+class ElementSpecificEquivariantMACExTB(torch.nn.Module):
+    """
+    Element-specific variant of EquivariantScaleShiftMACExTB.
+    Uses separate complete models for each element instead of just separate heads.
+    
+    WARNING: This is an experimental implementation with known limitations:
+    - Pair parameters are not implemented
+    - May have efficiency issues with large systems
+    - Global parameter combination needs validation
+    """
+    
+    def __init__(
+        self,
+        element_configs: Dict[int, Dict],  # atomic_number -> model config
+        shared_config: Dict,  # shared configuration for all element models
+        **kwargs,
+    ):
+        super().__init__()
+        
+        # Store element information
+        self.element_configs = element_configs
+        self.supported_elements = list(element_configs.keys())
+        self.num_supported_elements = len(self.supported_elements)
+        
+        # Create element to index mapping
+        self.element_to_idx = {z: i for i, z in enumerate(self.supported_elements)}
+        
+        # Register supported elements as buffer
+        self.register_buffer(
+            "supported_atomic_numbers", 
+            torch.tensor(self.supported_elements, dtype=torch.int64)
+        )
+        
+        # Store the original atomic numbers from shared config for mapping
+        if "atomic_numbers" in shared_config:
+            # Convert to tensor if it's a list
+            if isinstance(shared_config["atomic_numbers"], list):
+                original_atomic_numbers = torch.tensor(shared_config["atomic_numbers"], dtype=torch.int64)
+            else:
+                original_atomic_numbers = shared_config["atomic_numbers"]
+            self.register_buffer(
+                "original_atomic_numbers",
+                original_atomic_numbers
+            )
+        else:
+            self.register_buffer(
+                "original_atomic_numbers",
+                torch.tensor(self.supported_elements, dtype=torch.int64)
+            )
+        
+        # Create separate models for each element
+        self.element_models = torch.nn.ModuleDict()
+        
+        if not self.supported_elements:
+            raise ValueError("No elements provided in element_configs")
+        
+        for atomic_number in self.supported_elements:
+            print(f"Creating model for element {atomic_number}")
+            
+            # Merge shared config with element-specific config
+            element_config = {**shared_config, **element_configs[atomic_number]}
+            
+            # Keep the original atomic_numbers and num_elements for architecture compatibility
+            # Each element model will handle all element types but process only one at a time
+            # This way the node_attrs shape remains consistent with the original model
+            # We'll filter the data to contain only one element type before feeding to each model
+            
+            # Create the element-specific model with original architecture
+            model_name = f"element_{atomic_number}"
+            self.element_models[model_name] = EquivariantScaleShiftMACExTB(**element_config)
+        
+        # Store output dimensions from the first model (assuming all have same output dims)
+        if not self.element_models:
+            raise ValueError("No element models were created")
+            
+        first_model = next(iter(self.element_models.values()))
+        self.outdim = first_model.outdim
+        self.outdim_globpar = first_model.outdim_globpar
+        self.outdim_pair = first_model.outdim_pair
+        
+        # Network flags
+        self.elemnet = first_model.elemnet
+        self.globnet = first_model.globnet
+        self.pairnet = first_model.pairnet
+        
+        # Add compatibility attributes for training infrastructure
+        # Create a combined ModuleList that contains all interactions from all element models
+        self.interactions = torch.nn.ModuleList()
+        self.products = torch.nn.ModuleList()
+        self.readouts = torch.nn.ModuleList()
+        
+        for model in self.element_models.values():
+            self.interactions.extend(model.interactions)
+            self.products.extend(model.products)
+            self.readouts.extend(model.readouts)
+        
+        # Delegate other attributes to the first model for compatibility
+        self.node_embedding = first_model.node_embedding
+        self.radial_embedding = first_model.radial_embedding
+        self.spherical_harmonics = first_model.spherical_harmonics
+        self.atomic_energies_fn = first_model.atomic_energies_fn
+        
+        # Add other commonly accessed attributes
+        self.r_max = first_model.r_max
+        self.num_interactions = first_model.num_interactions
+        # FIX: Use original atomic numbers instead of first model's atomic numbers
+        self.atomic_numbers = self.original_atomic_numbers
+        
+    def _group_atoms_by_element(self, data: Dict[str, torch.Tensor]) -> tuple:
+        """Group atoms by their element type and create separate data dictionaries"""
+        
+        # Get atomic numbers for each atom from one-hot encoding
+        atomic_numbers_onehot = data["node_attrs"].argmax(dim=1)
+        
+        # Use the stored original atomic numbers for mapping
+        original_atomic_numbers = self.original_atomic_numbers
+        
+        grouped_data = {}
+        atom_indices_map = {}  # Track original indices for result reconstruction
+        
+        for element_z in self.supported_elements:
+            # Find the index of this element in the original encoding
+            element_mask_list = (original_atomic_numbers == element_z)
+            if not element_mask_list.any():
+                continue  # This element not in original model
+                
+            element_idx_in_original = torch.where(element_mask_list)[0][0].item()
+                
+            # Find atoms of this element
+            element_mask = (atomic_numbers_onehot == element_idx_in_original)
+            
+            if not element_mask.any():
+                continue  # Skip if no atoms of this element
+                
+            element_indices = torch.where(element_mask)[0]
+            atom_indices_map[element_z] = element_indices
+            
+            # Create data subset for this element
+            element_data = {}
+            
+            # Node-level data - create proper element encoding
+            # Ensure consistent device and dtype
+            device = data["node_attrs"].device
+            dtype = data["node_attrs"].dtype
+            num_elements = data["node_attrs"].shape[1]  # Get original number of elements
+            
+            # GRADIENT-SAFE: Use original data slicing to preserve gradients
+            # Extract only atoms of this element type while preserving gradients
+            element_data["node_attrs"] = data["node_attrs"][element_indices]  # Preserves gradients
+            element_data["positions"] = data["positions"][element_indices]  # Preserves gradients
+            
+            # Edge-level data - filter and reindex edges
+            edge_mask = torch.isin(data["edge_index"][0], element_indices) & torch.isin(data["edge_index"][1], element_indices)
+            
+            if edge_mask.any():
+                element_edges = data["edge_index"][:, edge_mask]
+                
+                # Safe edge reindexing - use dictionary mapping approach
+                old_to_new_idx = {old_idx.item(): new_idx for new_idx, old_idx in enumerate(element_indices)}
+                
+                # Create reindexed edges safely with proper data type
+                element_edges_reindexed = torch.zeros_like(element_edges, dtype=torch.long, device=device)
+                for i in range(element_edges.shape[1]):
+                    src_idx = element_edges[0, i].item()
+                    dst_idx = element_edges[1, i].item()
+                    
+                    # Ensure indices exist in mapping (they should due to edge_mask filtering)
+                    if src_idx in old_to_new_idx and dst_idx in old_to_new_idx:
+                        new_src = old_to_new_idx[src_idx]
+                        new_dst = old_to_new_idx[dst_idx]
+                        
+                        # Validate indices are within bounds
+                        if 0 <= new_src < len(element_indices) and 0 <= new_dst < len(element_indices):
+                            element_edges_reindexed[0, i] = new_src
+                            element_edges_reindexed[1, i] = new_dst
+                        else:
+                            print(f"Warning: Reindexed edge out of bounds: ({new_src}, {new_dst}), max={len(element_indices)-1}")
+                            element_edges_reindexed[0, i] = 0
+                            element_edges_reindexed[1, i] = 0
+                    else:
+                        # This shouldn't happen due to filtering, but safety check
+                        print(f"Warning: Edge index not found in mapping: {src_idx}, {dst_idx}")
+                        element_edges_reindexed[0, i] = 0  # Safe fallback
+                        element_edges_reindexed[1, i] = 0
+                
+                element_data["edge_index"] = element_edges_reindexed
+                
+                # GRADIENT-SAFE: Handle shifts preserving gradients
+                if "shifts" in data:
+                    element_data["shifts"] = data["shifts"][edge_mask]  # Preserves gradients
+                else:
+                    element_data["shifts"] = torch.zeros(element_edges.shape[1], 3, device=device, dtype=data["positions"].dtype)
+            else:
+                # No edges for this element (isolated atoms)
+                element_data["edge_index"] = torch.zeros((2, 0), dtype=torch.long, device=device)
+                element_data["shifts"] = torch.zeros((0, 3), device=device, dtype=data["positions"].dtype)
+            
+            # Graph-level data - treat as single graph with consistent device/dtype
+            element_data["batch"] = torch.zeros(len(element_indices), dtype=torch.long, device=device)
+            element_data["ptr"] = torch.tensor([0, len(element_indices)], dtype=torch.long, device=device)
+            
+            # GRADIENT-SAFE: Copy other necessary data preserving gradients
+            for key in ["cell", "unit_shifts"]:
+                if key in data:
+                    # These are typically constant tensors that don't need gradients, but preserve them anyway
+                    element_data[key] = data[key] if isinstance(data[key], torch.Tensor) else data[key]
+            
+            # Handle head information - create consistent head data for element subset
+            # Since each element model has only one element type, set all heads to 0
+            if "head" in data:
+                element_data["head"] = torch.zeros(len(element_indices), dtype=data["head"].dtype, device=device)
+            else:
+                element_data["head"] = torch.zeros(len(element_indices), dtype=torch.long, device=device)
+            
+            grouped_data[element_z] = element_data
+            
+        return grouped_data, atom_indices_map
+    
+    def _combine_element_outputs(
+        self, 
+        element_outputs: Dict[int, Dict[str, torch.Tensor]], 
+        atom_indices_map: Dict[int, torch.Tensor],
+        total_atoms: int,
+        device: torch.device
+    ) -> Dict[str, torch.Tensor]:
+        """Combine outputs from different element models"""
+        
+        combined_output = {}
+        
+        # GRADIENT-SAFE: Handle params_pred (node-level) preserving gradients
+        if self.elemnet and any("params_pred" in output and output["params_pred"] is not None for output in element_outputs.values()):
+            # Get dtype from first available output to ensure consistency
+            first_output = next(output["params_pred"] for output in element_outputs.values() if "params_pred" in output and output["params_pred"] is not None)
+            combined_params = torch.zeros((total_atoms, self.outdim), device=device, dtype=first_output.dtype)
+            
+            for element_z, output in element_outputs.items():
+                if "params_pred" in output and output["params_pred"] is not None:
+                    original_indices = atom_indices_map[element_z]
+                    # In-place assignment preserves gradients from element outputs
+                    combined_params[original_indices] = output["params_pred"]
+            combined_output["params_pred"] = combined_params
+        else:
+            combined_output["params_pred"] = None
+            
+        # FIX: Global parameters combination - use mean instead of sum for graph-level properties
+        if self.globnet:
+            globpars_list = []
+            element_weights = []  # Weight by number of atoms per element
+            
+            for element_z, output in element_outputs.items():
+                if "globpars_pred" in output and output["globpars_pred"] is not None:
+                    globpars_list.append(output["globpars_pred"])
+                    # Weight by number of atoms of this element
+                    num_atoms_element = len(atom_indices_map[element_z])
+                    element_weights.append(num_atoms_element)
+            
+            if globpars_list:
+                # GRADIENT-SAFE: Weighted average preserving gradients
+                globpars_tensor = torch.stack(globpars_list)  # Preserves gradients
+                weights_tensor = torch.tensor(element_weights, device=device, dtype=globpars_tensor.dtype)
+                weights_tensor = weights_tensor / weights_tensor.sum()  # Normalize weights
+                
+                # This operation preserves gradients through globpars_tensor
+                combined_output["globpars_pred"] = torch.sum(
+                    globpars_tensor * weights_tensor.unsqueeze(-1), dim=0
+                )
+            else:
+                combined_output["globpars_pred"] = None
+        else:
+            combined_output["globpars_pred"] = None
+            
+        # GRADIENT-SAFE: Handle node_feats (node-level) preserving gradients
+        if any("node_feats" in output and output["node_feats"] is not None for output in element_outputs.values()):
+            # Get feature dimension and dtype from first available output
+            feat_dim = None
+            first_node_feats = None
+            for output in element_outputs.values():
+                if "node_feats" in output and output["node_feats"] is not None:
+                    feat_dim = output["node_feats"].shape[-1]
+                    first_node_feats = output["node_feats"]
+                    break
+            
+            if feat_dim is not None and first_node_feats is not None:
+                combined_feats = torch.zeros((total_atoms, feat_dim), device=device, dtype=first_node_feats.dtype)
+                for element_z, output in element_outputs.items():
+                    if "node_feats" in output and output["node_feats"] is not None:
+                        original_indices = atom_indices_map[element_z]
+                        # In-place assignment preserves gradients from element outputs
+                        combined_feats[original_indices] = output["node_feats"]
+                combined_output["node_feats"] = combined_feats
+            else:
+                combined_output["node_feats"] = None
+        else:
+            combined_output["node_feats"] = None
+            
+        # WARNING: Pair parameters not implemented - this is a known limitation
+        combined_output["pair_param"] = None
+        
+        return combined_output
+    
+    def forward(
+        self,
+        data: Dict[str, torch.Tensor],
+        training: bool = False,
+        compute_force: bool = True,
+        compute_virials: bool = False,
+        compute_stress: bool = False,
+        compute_displacement: bool = False,
+        compute_hessian: bool = False,
+        output_indices = None,
+        save_intermediate: bool = False,
+        save_dir: str = "./tsne_features",
+    ) -> Dict[str, Optional[torch.Tensor]]:
+        
+        # Debug: Check input data integrity before processing
+        try:
+            for key, value in data.items():
+                if isinstance(value, torch.Tensor):
+                    if torch.isnan(value).any() or torch.isinf(value).any():
+                        print(f"Warning: Invalid values in input {key}: NaN={torch.isnan(value).any()}, Inf={torch.isinf(value).any()}")
+                    if value.dtype == torch.long and key in ["edge_index", "batch"] and (value < 0).any():
+                        print(f"Warning: Negative indices in input {key}: min={value.min()}, max={value.max()}")
+        except Exception as e:
+            print(f"Debug check failed: {e}")
+        
+        # Group atoms by element
+        grouped_data, atom_indices_map = self._group_atoms_by_element(data)
+        
+        # Check if we have any atoms to process
+        if not grouped_data:
+            # Return empty results if no supported elements found
+            device = data["positions"].device
+            total_atoms = data["positions"].shape[0]
+            return {
+                "params_pred": torch.zeros((total_atoms, self.outdim), device=device) if self.elemnet else None,
+                "globpars_pred": torch.zeros((1, self.outdim_globpar), device=device) if self.globnet else None,
+                "node_feats": torch.zeros((total_atoms, 64), device=device),  # Default feature size
+                "pair_param": None,
+            }
+        
+        # Process each element with its dedicated model
+        element_outputs = {}
+        for element_z, element_data in grouped_data.items():
+            model_name = f"element_{element_z}"
+            if model_name not in self.element_models:
+                continue  # Skip if model doesn't exist for this element
+                
+            model = self.element_models[model_name]
+            
+            # Debug: Check element data integrity before forward pass
+            try:
+                for key, value in element_data.items():
+                    if isinstance(value, torch.Tensor):
+                        if torch.isnan(value).any() or torch.isinf(value).any():
+                            print(f"Warning: Invalid values in element_{element_z} {key}: NaN={torch.isnan(value).any()}, Inf={torch.isinf(value).any()}")
+                        if value.dtype == torch.long and key == "edge_index" and value.numel() > 0:
+                            max_node_idx = element_data["positions"].shape[0] - 1
+                            if (value < 0).any() or (value > max_node_idx).any():
+                                print(f"Warning: Invalid edge indices in element_{element_z}: min={value.min()}, max={value.max()}, expected range=[0,{max_node_idx}]")
+            except Exception as e:
+                print(f"Element data debug check failed for element_{element_z}: {e}")
+            
+            # Forward pass for this element
+            element_output = model(
+                element_data,
+                training=training,
+                compute_force=compute_force,
+                compute_virials=compute_virials,
+                compute_stress=compute_stress,
+                compute_displacement=compute_displacement,
+                compute_hessian=compute_hessian,
+                output_indices=None,  # Will handle output_indices at the end
+                save_intermediate=save_intermediate,
+                save_dir=f"{save_dir}/element_{element_z}" if save_intermediate else save_dir,
+            )
+            
+            element_outputs[element_z] = element_output
+        
+        # Combine outputs from all elements
+        total_atoms = data["positions"].shape[0]
+        combined_output = self._combine_element_outputs(
+            element_outputs, 
+            atom_indices_map, 
+            total_atoms, 
+            data["positions"].device
+        )
+        
+        # Apply output_indices if specified
+        if output_indices is not None and combined_output["params_pred"] is not None:
+            combined_output["params_pred"] = combined_output["params_pred"][output_indices]
+        
+        # GRADIENT VERIFICATION: Check that gradients are preserved
+        if training and hasattr(data["positions"], 'requires_grad') and data["positions"].requires_grad:
+            for key, value in combined_output.items():
+                if value is not None and isinstance(value, torch.Tensor) and value.numel() > 0:
+                    if not value.requires_grad:
+                        print(f"Warning: Output {key} does not require gradients despite input requiring gradients")
+                    # else:
+                    #     print(f"✓ Output {key} properly requires gradients")
+            
+        return combined_output
