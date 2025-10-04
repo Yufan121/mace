@@ -133,6 +133,9 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--half_range_pt_pair", help="Yufan: lens of scaling factors for NNxTB output", type=float, nargs='+'
     )
+    parser.add_argument(
+        "--cnt_size", help="Yufan: connecting layer size for ScaleShiftMACExTB", type=int, default=164
+    )
     
     parser.add_argument(
         "--scatter_method",

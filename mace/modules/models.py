@@ -581,6 +581,7 @@ class ScaleShiftMACExTB(MACE):
         use_custom_ranges: bool = False,
         use_scale_predictor: bool = False,
         scatter_method: str = "scatter_sum",
+        cnt_size: int = 164,  # 100 + 64
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -635,28 +636,28 @@ class ScaleShiftMACExTB(MACE):
         self.half_range_pt_pair = torch.tensor(half_range_pt_pair or [0.05] * self.outdim_pair, dtype=torch.get_default_dtype())
 
         # Define connecting layer size
-        # cnt_size = 256 + 35        # TODO
-        cnt_size = 64 + 100
+        # Store cnt_size as instance variable for use in methods
+        self.cnt_size = cnt_size
         
         # Create output heads
         if self.separate_output_heads:
-            self.output_heads = self._create_output_heads(self.outdim, self.parallel_units_elempar, cnt_size)
-            self.output_globpar_heads = self._create_output_heads(self.outdim_globpar, self.parallel_units_globpar, cnt_size)
-            self.output_pair_heads = self._create_output_heads(self.outdim_pair, self.parallel_units_pair, cnt_size)
+            self.output_heads = self._create_output_heads(self.outdim, self.parallel_units_elempar, self.cnt_size)
+            self.output_globpar_heads = self._create_output_heads(self.outdim_globpar, self.parallel_units_globpar, self.cnt_size)
+            self.output_pair_heads = self._create_output_heads(self.outdim_pair, self.parallel_units_pair, self.cnt_size)
         else:
-            self.output_head = self._create_combined_head(self.outdim, self.parallel_units_elempar, cnt_size)
-            self.output_globpar_head = self._create_combined_head(self.outdim_globpar, self.parallel_units_globpar, cnt_size)
-            self.output_pair_head = self._create_combined_head(self.outdim_pair, self.parallel_units_pair, cnt_size)
+            self.output_head = self._create_combined_head(self.outdim, self.parallel_units_elempar, self.cnt_size)
+            self.output_globpar_head = self._create_combined_head(self.outdim_globpar, self.parallel_units_globpar, self.cnt_size)
+            self.output_pair_head = self._create_combined_head(self.outdim_pair, self.parallel_units_pair, self.cnt_size)
             
         # Define output activation
         self.out = torch.nn.Identity()
         
         # Create scale and shift predictors only if enabled
         if self.use_scale_predictor:
-            self.scale_predictor = self._create_predictor(cnt_size, self.outdim)
-            self.shift_predictor = self._create_predictor(cnt_size, self.outdim, use_softplus=False)
-            self.scale_predictor_globpar = self._create_predictor(cnt_size, self.outdim_globpar)
-            self.shift_predictor_globpar = self._create_predictor(cnt_size, self.outdim_globpar, use_softplus=False)
+            self.scale_predictor = self._create_predictor(self.cnt_size, self.outdim)
+            self.shift_predictor = self._create_predictor(self.cnt_size, self.outdim, use_softplus=False)
+            self.scale_predictor_globpar = self._create_predictor(self.cnt_size, self.outdim_globpar)
+            self.shift_predictor_globpar = self._create_predictor(self.cnt_size, self.outdim_globpar, use_softplus=False)
         else:
             self.scale_predictor = None
             self.shift_predictor = None

@@ -202,6 +202,7 @@ def _build_model(
             half_range_pt_globpar=args.half_range_pt_globpar,
             half_range_pt_pair=args.half_range_pt_pair,
             scatter_method=args.scatter_method,
+            cnt_size=getattr(args, 'cnt_size', 164),  # Default to 164 (100+64)
             
         )
     if args.model == "EquivariantScaleShiftMACExTB":
